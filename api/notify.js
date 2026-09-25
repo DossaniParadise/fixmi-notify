@@ -174,7 +174,7 @@ function fmtWhen(ts) {
   if (!n) return "";
   return new Date(n).toLocaleString("en-US", { timeZone: "America/Chicago", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
-function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment, wouldHaveGoneTo, extra, thread }) {
+function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment, wouldHaveGoneTo, extra, thread, canReply }) {
   const url = `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticket._id || "")}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
   const headline = headlineFor(event, store, ticket, prevStatus, comment, extra);
   const closeNote = ticket.closeNote && ticket.closeNote.text ? ticket.closeNote : null;
@@ -239,6 +239,8 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Conversation · ${convo.length} comment${convo.length === 1 ? "" : "s"}</div>
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0">${convoHtml}</table>
   </td></tr>` : ""}
+  ${canReply ? `<tr><td style="padding:18px 24px 0"><div style="font-size:13px;color:#6b7280;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:11px 14px">
+    <b style="color:#111827">You can just reply to this email.</b> Your reply is added to the ticket as a comment and everyone else on it is notified.</div></td></tr>` : ""}
   <tr><td style="padding:24px"><a href="${esc(url)}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px">See more on FixMi →</a></td></tr>
   <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af">Dossani Paradise · Repair &amp; Maintenance · Ticket ${esc(ticket.shortId || "")}</td></tr>
 </table></td></tr></table></body></html>`;
@@ -253,6 +255,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     ...(closeNote ? ["", `CLOSING NOTES · ${closeNote.by || ""}`, closeNote.text] : []),
     ...(convo.length ? ["", `CONVERSATION (${convo.length})`,
       ...convo.map((c, i) => `${i + 1}. ${c.by || "Someone"} · ${fmtWhen(c.ts)}${(Number(c.ts) || 0) === newestTs ? "  ← newest" : ""}\n   ${(c.text || "").replace(/\n/g, "\n   ")}`)] : []),
+    ...(canReply ? ["", "Reply to this email and your reply is added to the ticket as a comment."] : []),
     "", `See more on FixMi: ${url}`,
     "", "--", "Dossani Paradise · Repair & Maintenance",
   ].join("\n");
@@ -285,6 +288,7 @@ module.exports = async (req, res) => {
       appUrl: process.env.FIXMI_APP_URL || DEFAULTS.appUrl,
       masterUrl: process.env.FIXMI_MASTER_URL || DEFAULTS.masterUrl,
       stream: process.env.FIXMI_STREAM || DEFAULTS.stream,
+      replyDomain: process.env.FIXMI_REPLY_DOMAIN || "",
       dryRun: process.env.FIXMI_DRY_RUN === "1",
     };
     if (!cfg.token && !cfg.dryRun && event !== "selftest") return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
@@ -389,13 +393,16 @@ module.exports = async (req, res) => {
                              : "nobody is set to receive this event — check Settings → Email, and that these people have emails in FindMi",
     });
 
-    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment, wouldHaveGoneTo, extra: { assigneeChanged, assignee }, thread });
+    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment, wouldHaveGoneTo, extra: { assigneeChanged, assignee }, thread, canReply: !!cfg.replyDomain });
     const subject = subjectFor(store, ticket);   // no [TEST] prefix: it would split the thread when test mode is turned off
     const threadId = `<fixmi-${ticketId}@dossaniparadise.com>`;    // same on every mail about this ticket → clients thread them
 
     const messages = people.map(p => ({
       From: `FixMi <${cfg.from}>`,
       To: `"${String(p.name).replace(/"/g, "")}" <${p.email}>`,
+      // Replies go to reply+<ticket id>@… so Postmark can tell us, on the way
+      // back in, which ticket the reply belongs to. Unset until inbound is on.
+      ...(cfg.replyDomain ? { ReplyTo: `reply+${ticketId}@${cfg.replyDomain}` } : {}),
       Subject: subject,
       HtmlBody: html,
       TextBody: text,
