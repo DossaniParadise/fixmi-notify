@@ -102,11 +102,161 @@ function identify(master, email) {
     || null;
 }
 
+/* Find the ticket a piece of mail belongs to: the +hash on the address first,
+   then the [23086-PLM-0004] tag the subject always carries. Shared by the real
+   handler and by the simulator behind the connection checker. */
+function matchTicket(tickets, payload) {
+  let id = String(payload.MailboxHash || "").trim();
+  if (id && tickets[id]) return { id, how: "the +hash on the reply address" };
+  const m = String(payload.Subject || "").match(/\[([A-Za-z0-9-]+-[A-Za-z]+-\d+)\]/);
+  if (m) {
+    const want = m[1].toUpperCase();
+    const hit = Object.keys(tickets).find(k => String(tickets[k].shortId || "").toUpperCase() === want);
+    if (hit) return { id: hit, how: `the ${m[1]} tag in the subject` };
+  }
+  return { id: "", how: null };
+}
+
+/* ── DIAGNOSTICS ─────────────────────────────────────────────────────────────
+   FixMi's Settings → Email checker calls these with the shared secret in the
+   body. "selftest" reports how this function is configured and proves it can
+   actually write to the master; "simulate" runs a made-up reply all the way
+   through and reports what WOULD happen, writing nothing and emailing nobody. */
+async function diagnostics(p, req, res) {
+  const masterUrl = process.env.FIXMI_MASTER_URL || DEFAULTS.masterUrl;
+  const writePass = process.env.FIXMI_WRITE_PASSWORD || "";
+  const self = (process.env.FIXMI_SELF_URL || `https://${req.headers.host}`).replace(/\/$/, "");
+
+  let master = null, masterErr = null;
+  try {
+    const r = await fetch(masterUrl, { headers: { accept: "application/json" } });
+    if (r.ok) master = await r.json(); else masterErr = `HTTP ${r.status}`;
+  } catch (e) { masterErr = (e && e.message) || String(e); }
+
+  if (p.event === "selftest") {
+    let parser = false, parserError = null;
+    try {
+      const Parser = require("email-reply-parser").default || require("email-reply-parser");
+      new Parser().read("hi");
+      parser = true;
+    } catch (e) { parserError = (e && e.message) || String(e); }
+
+    /* Prove the write password, rather than only reporting that one is set —
+       a wrong password is the failure that would otherwise only show up when a
+       real reply silently vanished. Writes one tiny bookkeeping node. */
+    let writeOk = null, writeErr = null;
+    if (writePass) {
+      try {
+        const w = await fetch(masterUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: writePass, updates: { "admins/inboundCheck": { at: Date.now(), by: "connection check" } } }),
+        });
+        writeOk = w.ok;
+        if (!w.ok) writeErr = `HTTP ${w.status} ${(await w.text().catch(() => "")).slice(0, 120)}`;
+      } catch (e) { writeOk = false; writeErr = (e && e.message) || String(e); }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      writePassPresent: !!writePass,
+      writeOk, writeErr,
+      replyDomain: process.env.FIXMI_REPLY_DOMAIN || "",
+      basicAuth: !!(process.env.FIXMI_INBOUND_USER && process.env.FIXMI_INBOUND_PASS),
+      parser, parserError,
+      selfUrl: self,
+      webhookUrl: `${self}/api/inbound?key=<your FIXMI_SHARED_SECRET>`,
+      masterOk: !!master, masterErr,
+      ticketsSeen: master ? Object.keys(master[DEFAULTS.ticketsNode] || {}).length : 0,
+    });
+  }
+
+  if (p.event === "simulate") {
+    if (!master) return res.status(200).json({ ok: false, reason: `could not read the master (${masterErr})` });
+    const tickets = master[DEFAULTS.ticketsNode] || {};
+    const from = lc(p.from);
+    if (!from.includes("@")) return res.status(200).json({ ok: false, reason: "give a from address" });
+
+    const payload = {
+      FromFull: { Email: from, Name: p.fromName || "" },
+      From: from,
+      Subject: p.subject || "",
+      TextBody: p.text || "",
+      StrippedTextReply: "",
+      MailboxHash: p.ticketId || "",
+      MessageID: "simulated",
+      Headers: [],
+    };
+
+    const automated = isAutomated(payload);
+    const { id, how } = matchTicket(tickets, payload);
+    const ticket = id ? tickets[id] : null;
+    const text = cleanReply(payload);
+    const known = identify(master, from);
+    const by = known ? known.name : ((p.fromName || "").trim() ? `${p.fromName.trim()} (${from})` : from);
+    const dupe = !!(ticket && arr(ticket.comments).some(c => c && lc(c.email) === from && String(c.text || "").trim() === text.trim()));
+
+    // Who the comment notification would go to — asked of /api/notify so the
+    // answer comes from the same code that really sends it.
+    let wouldEmail = null, notifyErr = null;
+    if (ticket && !automated && text) {
+      try {
+        const n = await fetch(`${self}/api/notify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            secret: process.env.FIXMI_SHARED_SECRET, event: "selftest",
+            ticketId: id, forEvent: "comment", actorEmail: from,
+          }),
+        });
+        const j = await n.json().catch(() => null);
+        if (j && j.ticket) wouldEmail = arr(j.ticket.recipients).map(x => `${x.email} (${x.role})`);
+        else notifyErr = (j && j.error) || `HTTP ${n.status}`;
+      } catch (e) { notifyErr = (e && e.message) || String(e); }
+    }
+
+    const store = ticket ? (master.restaurants || {})[ticket.storeId] || {} : {};
+    return res.status(200).json({
+      ok: true,
+      automated,
+      matched: !!ticket,
+      matchedBy: how,
+      ticket: ticket ? { id, shortId: ticket.shortId || id, store: store.storeName || store.name || ticket.storeId || "", comments: arr(ticket.comments).length } : null,
+      author: { by, role: known ? known.role : "guest", known: !!known },
+      wouldWatch: !known,
+      text,
+      rawChars: String(p.text || "").length,
+      keptChars: text.length,
+      duplicate: dupe,
+      wouldEmail, notifyErr,
+    });
+  }
+
+  return res.status(400).json({ error: "unknown diagnostic event" });
+}
+
 module.exports = async (req, res) => {
+  const allowOrigin = process.env.FIXMI_ALLOW_ORIGIN || "*";
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.status(204).end();
   const ok = (body) => res.status(200).json(body);            // always 200: see the note up top
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
+    const p = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+
+    /* FixMi's own checker, not Postmark. Postmark payloads never carry a
+       `secret`, so the two can't be confused. Authenticated by the same shared
+       secret the app already holds. */
+    if (p && typeof p.event === "string" && ["selftest", "simulate"].includes(p.event)) {
+      const want = process.env.FIXMI_SHARED_SECRET || "";
+      if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set" });
+      if (p.secret !== want) return res.status(401).json({ error: "bad secret" });
+      return await diagnostics(p, req, res);
+    }
+
     // --- who's calling -------------------------------------------------------
     const user = process.env.FIXMI_INBOUND_USER, pass = process.env.FIXMI_INBOUND_PASS;
     if (user && pass) {
@@ -118,7 +268,6 @@ module.exports = async (req, res) => {
       if (key !== process.env.FIXMI_SHARED_SECRET) return res.status(401).json({ error: "bad or missing ?key=" });
     }
 
-    const p = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const masterUrl = process.env.FIXMI_MASTER_URL || DEFAULTS.masterUrl;
     const writePass = process.env.FIXMI_WRITE_PASSWORD || "";
     if (!writePass) return ok({ ignored: true, reason: "FIXMI_WRITE_PASSWORD is not set — cannot write the comment" });
@@ -136,16 +285,9 @@ module.exports = async (req, res) => {
     const master = await r.json();
     const tickets = master[DEFAULTS.ticketsNode] || {};
 
-    let id = String(p.MailboxHash || "").trim();
-    if (!id || !tickets[id]) {
-      // No hash (someone wrote to the address directly, or forwarded it) —
-      // fall back to the [23086-PLM-0004] tag the subject always carries.
-      const m = String(p.Subject || "").match(/\[([A-Za-z0-9-]+-[A-Za-z]+-\d+)\]/);
-      if (m) {
-        const want = m[1].toUpperCase();
-        id = Object.keys(tickets).find(k => String(tickets[k].shortId || "").toUpperCase() === want) || "";
-      }
-    }
+    // No hash means someone wrote to the address directly, or forwarded it —
+    // matchTicket falls back to the [23086-PLM-0004] tag in the subject.
+    const { id } = matchTicket(tickets, p);
     if (!id || !tickets[id]) {
       console.log("[fixmi-inbound] no ticket for", p.MailboxHash, "|", p.Subject);
       return ok({ ignored: true, reason: "could not tell which ticket this reply belongs to" });
@@ -227,3 +369,4 @@ module.exports.cleanReply = cleanReply;
 module.exports.trimSignOff = trimSignOff;
 module.exports.isAutomated = isAutomated;
 module.exports.identify = identify;
+module.exports.matchTicket = matchTicket;
