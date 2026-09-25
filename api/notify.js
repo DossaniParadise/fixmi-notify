@@ -278,7 +278,7 @@ module.exports = async (req, res) => {
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
     if (secret !== want) return res.status(401).json({ error: "bad secret" });
-    const DIAG = ["selftest", "sendtest"];
+    const DIAG = ["selftest", "sendtest", "postmark"];
     if (!EVENTS.includes(event) && !DIAG.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
     if (!ticketId && !DIAG.includes(event)) return res.status(400).json({ error: "ticketId is required" });
 
@@ -291,7 +291,7 @@ module.exports = async (req, res) => {
       replyDomain: process.env.FIXMI_REPLY_DOMAIN || "",
       dryRun: process.env.FIXMI_DRY_RUN === "1",
     };
-    if (!cfg.token && !cfg.dryRun && event !== "selftest") return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+    if (!cfg.token && !cfg.dryRun && event !== "selftest" && event !== "postmark") return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
     if (process.env.FIXMI_NOTIFY_OFF === "1" && !DIAG.includes(event)) return res.status(200).json({ sent: 0, reason: "notifications switched off" });
 
     // The master is the source of truth for WHO gets mailed. The ticket body may
@@ -320,6 +320,11 @@ module.exports = async (req, res) => {
         ticketsSeen: Object.keys(master.maintenanceTickets || {}).length,
         prefsFound: !!(master.admins || {}).notifyPrefs,
         prefs: { on: prefs0.on, testMode: prefs0.testMode, testTo: prefs0.testTo, alwaysTo: prefs0.alwaysTo, roles: prefs0.roles },
+        reply: {
+          enabled: !!cfg.replyDomain,
+          domain: cfg.replyDomain || null,
+          sample: cfg.replyDomain && ticketId ? `reply+${ticketId}@${cfg.replyDomain}` : null,
+        },
       };
       if (ticketId) {
         const t = { ...((master.maintenanceTickets || {})[ticketId] || {}), ...(sent || {}), _id: ticketId };
@@ -328,10 +333,56 @@ module.exports = async (req, res) => {
           id: ticketId, shortId: t.shortId || null, store: storeLabel(st),
           knownToMaster: !!(master.maintenanceTickets || {})[ticketId],
           subject: t.storeId ? subjectFor(st, t) : null,
-          recipients: t.storeId ? recipientsFor(master, t, { prefs: prefs0, event: "created", actorEmail }) : [],
+          recipients: t.storeId ? recipientsFor(master, t, { prefs: prefs0, event: EVENTS.includes(body.forEvent) ? body.forEvent : "created", actorEmail }) : [],
         };
       }
       return res.status(200).json(out);
+    }
+
+    /* "postmark" asks Postmark itself how this server is set up, so the checker
+       can say whether the inbound stream really points back at us — the one
+       thing we cannot see from our own side. The token never leaves here, and
+       Postmark's copy of it is stripped from the reply. */
+    if (event === "postmark") {
+      if (!cfg.token) return res.status(200).json({ ok: false, reason: "POSTMARK_TOKEN is not set in Vercel" });
+      const H = { "Accept": "application/json", "X-Postmark-Server-Token": cfg.token };
+      let srv = null, srvStatus = 0;
+      try {
+        const s1 = await fetch("https://api.postmarkapp.com/server", { headers: H });
+        srvStatus = s1.status;
+        srv = await s1.json().catch(() => null);
+      } catch (e) {
+        return res.status(200).json({ ok: false, reason: `could not reach Postmark (${(e && e.message) || e})` });
+      }
+      if (srvStatus === 401) return res.status(200).json({ ok: false, reason: "Postmark rejected the token — POSTMARK_TOKEN is wrong, or it is an Account token rather than this server's token" });
+      if (srvStatus !== 200 || !srv) return res.status(200).json({ ok: false, reason: `Postmark answered HTTP ${srvStatus}` });
+
+      // Recent inbound, so the checker can show whether any mail has actually landed.
+      let inbound = null;
+      try {
+        const s2 = await fetch("https://api.postmarkapp.com/messages/inbound?count=5&offset=0", { headers: H });
+        const j2 = await s2.json().catch(() => null);
+        if (s2.ok && j2) inbound = {
+          total: j2.TotalCount || 0,
+          recent: arr(j2.InboundMessages).slice(0, 5).map(m => ({
+            from: m.From, subject: m.Subject, status: m.Status,
+            at: m.ReceivedAt, hash: m.MailboxHash || "",
+          })),
+        };
+      } catch (e) { /* a missing inbound list is not fatal */ }
+
+      return res.status(200).json({
+        ok: true,
+        serverName: srv.Name || "",
+        // never echo ApiTokens back to a browser
+        inboundHookUrl: srv.InboundHookUrl || "",
+        inboundDomain: srv.InboundDomain || "",
+        inboundAddress: srv.InboundAddress || "",
+        inboundSpamThreshold: srv.InboundSpamThreshold,
+        bounceHookUrl: srv.BounceHookUrl || "",
+        expectedReplyDomain: cfg.replyDomain || "",
+        inbound,
+      });
     }
 
     if (event === "sendtest") {
