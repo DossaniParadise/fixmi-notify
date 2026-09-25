@@ -294,11 +294,19 @@ module.exports = async (req, res) => {
     if (!cfg.token && !cfg.dryRun && event !== "selftest" && event !== "postmark") return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
     if (process.env.FIXMI_NOTIFY_OFF === "1" && !DIAG.includes(event)) return res.status(200).json({ sent: 0, reason: "notifications switched off" });
 
-    // The master is the source of truth for WHO gets mailed. The ticket body may
-    // come from the caller because the CDN copy can lag a minute behind a write.
-    const r = await fetch(cfg.masterUrl, { headers: { accept: "application/json" } });
-    if (!r.ok) return res.status(502).json({ error: `could not read the alignment master (HTTP ${r.status})` });
-    const master = await r.json();
+    /* The master is the source of truth for WHO gets mailed. The ticket body may
+       come from the caller because the CDN copy can lag a minute behind a write.
+       `_master` lets /api/inbound hand over the copy it has already downloaded —
+       it is only honoured behind the shared secret, checked just above, and it
+       saves a second multi-megabyte download on the reply path. */
+    let master;
+    if (body._master && typeof body._master === "object") {
+      master = body._master;
+    } else {
+      const r = await fetch(cfg.masterUrl, { headers: { accept: "application/json" } });
+      if (!r.ok) return res.status(502).json({ error: `could not read the alignment master (HTTP ${r.status})` });
+      master = await r.json();
+    }
 
     /* ---- DIAGNOSTICS -------------------------------------------------------
        "selftest" reports how this function is configured and who a given ticket
