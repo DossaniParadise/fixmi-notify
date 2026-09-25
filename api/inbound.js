@@ -52,15 +52,31 @@ function trimSignOff(text) {
   return String(text || "").trim();
 }
 
+/* email-reply-parser ships as an ES module, so on Vercel's Node a plain
+   require() of it throws ERR_REQUIRE_ESM. import() loads either kind, and the
+   promise is cached so the module is only pulled in once per cold start. */
+let _parserPromise = null;
+function loadParser() {
+  if (!_parserPromise) {
+    _parserPromise = import("email-reply-parser")
+      .then(m => m.default || m)
+      .catch(e1 => {
+        try { const r = require("email-reply-parser"); return r.default || r; }   // older CJS builds
+        catch (e2) { console.warn("[fixmi-inbound] reply parser unavailable:", (e1 && e1.message) || e1); return null; }
+      });
+  }
+  return _parserPromise;
+}
+
 /** Just the words this person typed: no quoted history, no signature. */
-function cleanReply(payload) {
+async function cleanReply(payload) {
   const raw = payload.TextBody || payload.StrippedTextReply || "";
   let out = "";
-  try {
-    const Parser = require("email-reply-parser").default || require("email-reply-parser");
-    out = new Parser().read(raw).getVisibleText() || "";
-  } catch (e) {
-    console.warn("[fixmi-inbound] reply parser unavailable, falling back", e && e.message);
+  const Parser = await loadParser();
+  if (Parser) {
+    try { out = new Parser().read(raw).getVisibleText() || ""; }
+    catch (e) { console.warn("[fixmi-inbound] parse failed, falling back", e && e.message); out = payload.StrippedTextReply || raw; }
+  } else {
     out = payload.StrippedTextReply || raw;
   }
   out = trimSignOff(out);
@@ -136,7 +152,8 @@ async function diagnostics(p, req, res) {
   if (p.event === "selftest") {
     let parser = false, parserError = null;
     try {
-      const Parser = require("email-reply-parser").default || require("email-reply-parser");
+      const Parser = await loadParser();
+      if (!Parser) throw new Error("the module could not be loaded");
       new Parser().read("hi");
       parser = true;
     } catch (e) { parserError = (e && e.message) || String(e); }
@@ -191,7 +208,7 @@ async function diagnostics(p, req, res) {
     const automated = isAutomated(payload);
     const { id, how } = matchTicket(tickets, payload);
     const ticket = id ? tickets[id] : null;
-    const text = cleanReply(payload);
+    const text = await cleanReply(payload);
     const known = identify(master, from);
     const by = known ? known.name : ((p.fromName || "").trim() ? `${p.fromName.trim()} (${from})` : from);
     const dupe = !!(ticket && arr(ticket.comments).some(c => c && lc(c.email) === from && String(c.text || "").trim() === text.trim()));
@@ -295,7 +312,7 @@ module.exports = async (req, res) => {
     const ticket = tickets[id];
 
     // --- the words -----------------------------------------------------------
-    const text = cleanReply(p);
+    const text = await cleanReply(p);
     if (!text) return ok({ ignored: true, reason: "nothing left after removing the quoted history" });
 
     // --- don't post the same reply twice on a webhook retry ------------------
