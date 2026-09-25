@@ -169,13 +169,40 @@ function headlineFor(event, store, ticket, prevStatus, comment, extra) {
   return from ? `${who} — ticket moved from ${from} to ${to}.` : `${who} — ticket moved to ${to}.`;
 }
 
-function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment, wouldHaveGoneTo, extra }) {
+function fmtWhen(ts) {
+  const n = Number(ts);
+  if (!n) return "";
+  return new Date(n).toLocaleString("en-US", { timeZone: "America/Chicago", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment, wouldHaveGoneTo, extra, thread }) {
   const url = `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticket._id || "")}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
   const headline = headlineFor(event, store, ticket, prevStatus, comment, extra);
   const closeNote = ticket.closeNote && ticket.closeNote.text ? ticket.closeNote : null;
   const assignee = (extra && extra.assignee) || ticket.assigneeLabel || "";
   const photos = arr(ticket.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6);
   const cPhotos = comment ? arr(comment.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6) : [];
+  /* The whole conversation, oldest first, with the one that triggered this
+     email picked out. Only on comment emails — bolting it onto every status
+     change would bury the change itself. */
+  const convo = (event === "comment" ? arr(thread) : []).filter(c => c && (c.text || (c.photos || []).length));
+  const newestTs = convo.length ? Math.max(...convo.map(c => Number(c.ts) || 0)) : 0;
+  const convoHtml = convo.map((c, i) => {
+    const isNew = (Number(c.ts) || 0) === newestTs;
+    const ph = arr(c.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 4);
+    return `<tr><td style="padding:0 0 10px">
+      <div style="border:1px solid ${isNew ? "#1d76bb" : "#e5e7eb"};background:${isNew ? "#eff6ff" : "#fff"};border-radius:9px;padding:10px 13px">
+        <div style="font-size:12px;color:#6b7280"><b style="color:#111827">${i + 1}. ${esc(c.by || "Someone")}</b>${c.email ? ` &lt;${esc(c.email)}&gt;` : ""} · ${esc(fmtWhen(c.ts))}${isNew ? ` <span style="color:#1d76bb;font-weight:700">· newest</span>` : ""}</div>
+        ${c.text ? `<div style="font-size:14.5px;line-height:1.5;white-space:pre-wrap;margin-top:4px">${esc(c.text)}</div>` : ""}
+        ${ph.length ? `<div style="margin-top:8px">${ph.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="120" alt="" style="width:120px;border-radius:6px;border:1px solid #e5e7eb;display:inline-block;margin:0 6px 6px 0"></a>`).join("")}</div>` : ""}
+      </div></td></tr>`;
+  }).join("");
+  // The new comment, big, directly under the headline — no scrolling for it.
+  const newCommentBlock = comment ? `<tr><td style="padding:4px 24px 0">
+    <div style="border-left:4px solid #1d76bb;background:#eff6ff;border-radius:0 9px 9px 0;padding:12px 16px">
+      <div style="font-size:12px;font-weight:700;color:#1d76bb;text-transform:uppercase;letter-spacing:.06em">New comment · ${esc(comment.by || "")}${comment.ts ? " · " + esc(fmtWhen(comment.ts)) : ""}</div>
+      ${comment.text ? `<div style="font-size:16px;line-height:1.55;white-space:pre-wrap;margin-top:6px">${esc(comment.text)}</div>` : ""}
+      ${cPhotos.length ? `<div style="margin-top:10px">${cPhotos.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="160" alt="Comment photo" style="width:160px;max-width:100%;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</div>` : ""}
+    </div></td></tr>` : "";
   const facts = [
     ["Store", storeLabel(store)],
     ["Status", STATUS_LABEL[ticket.status] || ticket.status],
@@ -196,7 +223,8 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     <b>Test mode.</b> Nobody else received this. Live, it would have gone to: ${esc(wouldHaveGoneTo.join(", ") || "nobody")}.</td></tr>` : ""}
   <tr><td style="padding:24px 24px 6px"><div style="font-size:19px;font-weight:700;line-height:1.35">${esc(headline)}</div>
     <div style="font-size:14px;color:#6b7280;margin-top:6px">See details below.</div></td></tr>
-  <tr><td style="padding:10px 24px 0"><table role="presentation" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7">
+  ${newCommentBlock}
+  <tr><td style="padding:14px 24px 0"><table role="presentation" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7">
     ${facts.map(([k, v]) => `<tr><td style="color:#6b7280;padding-right:16px;white-space:nowrap">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
   </table></td></tr>
   <tr><td style="padding:18px 24px 0">
@@ -207,23 +235,24 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Closing notes · ${esc(closeNote.by || "")}</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 14px">${esc(closeNote.text)}</div>
   </td></tr>` : ""}
-  ${comment ? `<tr><td style="padding:18px 24px 0">
-    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">New comment · ${esc(comment.by || "")}</div>
-    <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;border-left:3px solid #1d76bb;padding:6px 14px">${esc(comment.text || "")}</div>
-    ${cPhotos.length ? `<div style="margin-top:10px">${cPhotos.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="160" alt="Comment photo" style="width:160px;max-width:100%;height:auto;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</div>` : ""}
+  ${convoHtml ? `<tr><td style="padding:18px 24px 0">
+    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Conversation · ${convo.length} comment${convo.length === 1 ? "" : "s"}</div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0">${convoHtml}</table>
   </td></tr>` : ""}
   <tr><td style="padding:24px"><a href="${esc(url)}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px">See more on FixMi →</a></td></tr>
   <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af">Dossani Paradise · Repair &amp; Maintenance · Ticket ${esc(ticket.shortId || "")}</td></tr>
 </table></td></tr></table></body></html>`;
 
   const text = [
+    ...(comment ? [`NEW COMMENT · ${comment.by || ""}${comment.ts ? " · " + fmtWhen(comment.ts) : ""}`, comment.text || "", ...cPhotos, ""] : []),
     ...(wouldHaveGoneTo ? [`TEST MODE — nobody else received this. Live, it would have gone to: ${wouldHaveGoneTo.join(", ") || "nobody"}.`, ""] : []),
     headline, "",
     ...facts.map(([k, v]) => `${k}: ${v}`),
     "", "ISSUE", ticket.description || "No description",
     ...(photos.length ? ["", "PHOTOS", ...photos] : []),
     ...(closeNote ? ["", `CLOSING NOTES · ${closeNote.by || ""}`, closeNote.text] : []),
-    ...(comment ? ["", `NEW COMMENT · ${comment.by || ""}`, comment.text || "", ...cPhotos] : []),
+    ...(convo.length ? ["", `CONVERSATION (${convo.length})`,
+      ...convo.map((c, i) => `${i + 1}. ${c.by || "Someone"} · ${fmtWhen(c.ts)}${(Number(c.ts) || 0) === newestTs ? "  ← newest" : ""}\n   ${(c.text || "").replace(/\n/g, "\n   ")}`)] : []),
     "", `See more on FixMi: ${url}`,
     "", "--", "Dossani Paradise · Repair & Maintenance",
   ].join("\n");
@@ -241,7 +270,7 @@ module.exports = async (req, res) => {
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-    const { secret, event, ticketId, ticket: sent, prevStatus, actorEmail, actorName, comment, assigneeChanged, assignee } = body;
+    const { secret, event, ticketId, ticket: sent, prevStatus, actorEmail, actorName, comment, assigneeChanged, assignee, thread } = body;
 
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
@@ -360,7 +389,7 @@ module.exports = async (req, res) => {
                              : "nobody is set to receive this event — check Settings → Email, and that these people have emails in FindMi",
     });
 
-    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment, wouldHaveGoneTo, extra: { assigneeChanged, assignee } });
+    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment, wouldHaveGoneTo, extra: { assigneeChanged, assignee }, thread });
     const subject = subjectFor(store, ticket);   // no [TEST] prefix: it would split the thread when test mode is turned off
     const threadId = `<fixmi-${ticketId}@dossaniparadise.com>`;    // same on every mail about this ticket → clients thread them
 
