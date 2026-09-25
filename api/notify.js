@@ -139,18 +139,41 @@ function subjectFor(store, ticket) {
   return `[${ticket.shortId || "Ticket"}] ${storeLabel(store)}${cat ? " — " + cat : ""}`;
 }
 
-function headlineFor(event, store, ticket, prevStatus, comment) {
+/* Say what actually happened in words, not a status-code diff. "Moved from
+   Finished to Closed" tells a District Manager far less than "closed". */
+function headlineFor(event, store, ticket, prevStatus, comment, extra) {
   const who = storeLabel(store);
   if (event === "created") return `${who} has a new ticket open.`;
   if (event === "comment") return `${who} — new comment from ${(comment && comment.by) || "someone"}.`;
+
+  const assignee = (extra && extra.assignee) || ticket.assigneeLabel || "";
+  // Who it's on beats which column it sits in — lead with that when it changed.
+  if (extra && extra.assigneeChanged) {
+    return assignee
+      ? `${who} — ticket assigned to ${assignee}.`
+      : `${who} — ticket put back in the unassigned pool.`;
+  }
+  switch (ticket.status) {
+    case "closed":      return `${who} — ticket closed.`;
+    case "finished":    return `${who} — work finished.`;
+    case "in_progress": return `${who} — work started.`;
+    // The reasons are already phrased as "Awaiting parts" — lowercasing them
+    // into "waiting on awaiting parts" reads like a stutter.
+    case "waiting":     return `${who} — on hold${ticket.waitingReason ? " — " + ticket.waitingReason : ""}.`;
+    case "unassigned":  return `${who} — ticket put back in the unassigned pool.`;
+    case "assigned":
+    case "dispatched":  return assignee ? `${who} — ticket is with ${assignee}.` : `${who} — ticket dispatched.`;
+  }
   const to = STATUS_LABEL[ticket.status] || ticket.status || "updated";
   const from = STATUS_LABEL[prevStatus] || prevStatus;
   return from ? `${who} — ticket moved from ${from} to ${to}.` : `${who} — ticket moved to ${to}.`;
 }
 
-function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment, wouldHaveGoneTo }) {
+function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment, wouldHaveGoneTo, extra }) {
   const url = `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticket._id || "")}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
-  const headline = headlineFor(event, store, ticket, prevStatus, comment);
+  const headline = headlineFor(event, store, ticket, prevStatus, comment, extra);
+  const closeNote = ticket.closeNote && ticket.closeNote.text ? ticket.closeNote : null;
+  const assignee = (extra && extra.assignee) || ticket.assigneeLabel || "";
   const photos = arr(ticket.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6);
   const cPhotos = comment ? arr(comment.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6) : [];
   const facts = [
@@ -158,6 +181,8 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     ["Status", STATUS_LABEL[ticket.status] || ticket.status],
     ["Priority", ticket.priority ? (PRIORITY_LABEL[ticket.priority] || ticket.priority) : "Normal"],
     ["Category", ticket.categoryLabel || [ticket.category, ticket.subcategory].filter(Boolean).join(" › ")],
+    ["Assigned to", assignee],
+    ticket.status === "waiting" ? ["Waiting on", ticket.waitingReason] : null,
     ["Reported by", ticket.createdByName || ticket.createdBy],
     event === "created" ? null : [event === "comment" ? "Comment by" : "Changed by", (comment && comment.by) || actorName],
   ].filter(Boolean).filter(([, v]) => String(v == null ? "" : v).trim() !== "");   // a blank row is noise, not "—"
@@ -178,6 +203,10 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Issue</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px">${esc(ticket.description || "No description")}</div></td></tr>
   ${photos.length ? `<tr><td style="padding:14px 24px 0">${photos.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="160" alt="Ticket photo" style="width:160px;max-width:100%;height:auto;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</td></tr>` : ""}
+  ${closeNote ? `<tr><td style="padding:18px 24px 0">
+    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Closing notes · ${esc(closeNote.by || "")}</div>
+    <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 14px">${esc(closeNote.text)}</div>
+  </td></tr>` : ""}
   ${comment ? `<tr><td style="padding:18px 24px 0">
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">New comment · ${esc(comment.by || "")}</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;border-left:3px solid #1d76bb;padding:6px 14px">${esc(comment.text || "")}</div>
@@ -193,6 +222,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     ...facts.map(([k, v]) => `${k}: ${v}`),
     "", "ISSUE", ticket.description || "No description",
     ...(photos.length ? ["", "PHOTOS", ...photos] : []),
+    ...(closeNote ? ["", `CLOSING NOTES · ${closeNote.by || ""}`, closeNote.text] : []),
     ...(comment ? ["", `NEW COMMENT · ${comment.by || ""}`, comment.text || "", ...cPhotos] : []),
     "", `See more on FixMi: ${url}`,
     "", "--", "Dossani Paradise · Repair & Maintenance",
@@ -211,7 +241,7 @@ module.exports = async (req, res) => {
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-    const { secret, event, ticketId, ticket: sent, prevStatus, actorEmail, actorName, comment } = body;
+    const { secret, event, ticketId, ticket: sent, prevStatus, actorEmail, actorName, comment, assigneeChanged, assignee } = body;
 
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
@@ -330,7 +360,7 @@ module.exports = async (req, res) => {
                              : "nobody is set to receive this event — check Settings → Email, and that these people have emails in FindMi",
     });
 
-    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment, wouldHaveGoneTo });
+    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment, wouldHaveGoneTo, extra: { assigneeChanged, assignee } });
     const subject = subjectFor(store, ticket);   // no [TEST] prefix: it would split the thread when test mode is turned off
     const threadId = `<fixmi-${ticketId}@dossaniparadise.com>`;    // same on every mail about this ticket → clients thread them
 
