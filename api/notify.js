@@ -132,8 +132,11 @@ function storeLabel(store) {
   if (!num || name.includes(num)) return name;
   return `${name} #${num}`;
 }
+/* The subject has to stay IDENTICAL for every email about one ticket, or mail
+   clients stop threading them. Ticket number, store, then what's broken. */
 function subjectFor(store, ticket) {
-  return `[${ticket.shortId || "Ticket"}] ${storeLabel(store)}`;
+  const cat = String(ticket.categoryLabel || [ticket.category, ticket.subcategory].filter(Boolean).join(" → ")).trim();
+  return `[${ticket.shortId || "Ticket"}] ${storeLabel(store)}${cat ? " — " + cat : ""}`;
 }
 
 function headlineFor(event, store, ticket, prevStatus, comment) {
@@ -145,7 +148,7 @@ function headlineFor(event, store, ticket, prevStatus, comment) {
   return from ? `${who} — ticket moved from ${from} to ${to}.` : `${who} — ticket moved to ${to}.`;
 }
 
-function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment }) {
+function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment, wouldHaveGoneTo }) {
   const url = `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticket._id || "")}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
   const headline = headlineFor(event, store, ticket, prevStatus, comment);
   const photos = arr(ticket.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6);
@@ -164,6 +167,8 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment 
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f4f6"><tr><td align="center" style="padding:24px 12px">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#fff;border-radius:12px;overflow:hidden">
   <tr><td style="background:#1d76bb;padding:14px 24px;color:#fff;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">FixMi &nbsp;·&nbsp; Ticket ${esc(ticket.shortId || "")}</td></tr>
+  ${wouldHaveGoneTo ? `<tr><td style="background:#fffbeb;border-bottom:1px solid #fde68a;padding:11px 24px;font-size:12.5px;color:#92400e">
+    <b>Test mode.</b> Nobody else received this. Live, it would have gone to: ${esc(wouldHaveGoneTo.join(", ") || "nobody")}.</td></tr>` : ""}
   <tr><td style="padding:24px 24px 6px"><div style="font-size:19px;font-weight:700;line-height:1.35">${esc(headline)}</div>
     <div style="font-size:14px;color:#6b7280;margin-top:6px">See details below.</div></td></tr>
   <tr><td style="padding:10px 24px 0"><table role="presentation" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7">
@@ -183,6 +188,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment 
 </table></td></tr></table></body></html>`;
 
   const text = [
+    ...(wouldHaveGoneTo ? [`TEST MODE — nobody else received this. Live, it would have gone to: ${wouldHaveGoneTo.join(", ") || "nobody"}.`, ""] : []),
     headline, "",
     ...facts.map(([k, v]) => `${k}: ${v}`),
     "", "ISSUE", ticket.description || "No description",
@@ -258,7 +264,7 @@ module.exports = async (req, res) => {
         out.ticket = {
           id: ticketId, shortId: t.shortId || null, store: storeLabel(st),
           knownToMaster: !!(master.maintenanceTickets || {})[ticketId],
-          subject: t.storeId ? (prefs0.testMode ? "[TEST] " : "") + subjectFor(st, t) : null,
+          subject: t.storeId ? subjectFor(st, t) : null,
           recipients: t.storeId ? recipientsFor(master, t, { prefs: prefs0, event: "created", actorEmail }) : [],
         };
       }
@@ -313,14 +319,19 @@ module.exports = async (req, res) => {
 
     const store = (master.restaurants || {})[ticket.storeId] || {};
     const people = recipientsFor(master, ticket, { prefs, event, actorEmail });
+    // In test mode, say inside the email who it WOULD have gone to — more use
+    // than a [TEST] tag in the subject, and it leaves threading alone.
+    const wouldHaveGoneTo = prefs.testMode
+      ? recipientsFor(master, ticket, { prefs: { ...prefs, testMode: false }, event, actorEmail }).map(x => `${x.email} (${x.role})`)
+      : null;
     if (!people.length) return res.status(200).json({
       sent: 0,
       reason: prefs.testMode ? "test mode is on but no test addresses are set"
                              : "nobody is set to receive this event — check Settings → Email, and that these people have emails in FindMi",
     });
 
-    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment });
-    const subject = (prefs.testMode ? "[TEST] " : "") + subjectFor(store, ticket);
+    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment, wouldHaveGoneTo });
+    const subject = subjectFor(store, ticket);   // no [TEST] prefix: it would split the thread when test mode is turned off
     const threadId = `<fixmi-${ticketId}@dossaniparadise.com>`;    // same on every mail about this ticket → clients thread them
 
     const messages = people.map(p => ({
