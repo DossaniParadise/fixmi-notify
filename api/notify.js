@@ -210,8 +210,9 @@ module.exports = async (req, res) => {
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
     if (secret !== want) return res.status(401).json({ error: "bad secret" });
-    if (!EVENTS.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
-    if (!ticketId) return res.status(400).json({ error: "ticketId is required" });
+    const DIAG = ["selftest", "sendtest"];
+    if (!EVENTS.includes(event) && !DIAG.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
+    if (!ticketId && !DIAG.includes(event)) return res.status(400).json({ error: "ticketId is required" });
 
     const cfg = {
       token: process.env.POSTMARK_TOKEN || "",
@@ -221,14 +222,78 @@ module.exports = async (req, res) => {
       stream: process.env.FIXMI_STREAM || DEFAULTS.stream,
       dryRun: process.env.FIXMI_DRY_RUN === "1",
     };
-    if (!cfg.token && !cfg.dryRun) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
-    if (process.env.FIXMI_NOTIFY_OFF === "1") return res.status(200).json({ sent: 0, reason: "notifications switched off" });
+    if (!cfg.token && !cfg.dryRun && event !== "selftest") return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+    if (process.env.FIXMI_NOTIFY_OFF === "1" && !DIAG.includes(event)) return res.status(200).json({ sent: 0, reason: "notifications switched off" });
 
     // The master is the source of truth for WHO gets mailed. The ticket body may
     // come from the caller because the CDN copy can lag a minute behind a write.
     const r = await fetch(cfg.masterUrl, { headers: { accept: "application/json" } });
     if (!r.ok) return res.status(502).json({ error: `could not read the alignment master (HTTP ${r.status})` });
     const master = await r.json();
+
+    /* ---- DIAGNOSTICS -------------------------------------------------------
+       "selftest" reports how this function is configured and who a given ticket
+       would reach. It never contacts Postmark. "sendtest" sends one real email,
+       but only to an address the master already knows or that is listed in
+       Settings → Email — so this can't be turned into a way to mail strangers. */
+    if (event === "selftest") {
+      const prefs0 = prefsFrom(master);
+      const out = {
+        ok: true,
+        tokenPresent: !!cfg.token,
+        dryRun: cfg.dryRun,
+        notifyOff: process.env.FIXMI_NOTIFY_OFF === "1",
+        from: cfg.from,
+        appUrl: cfg.appUrl,
+        stream: cfg.stream,
+        allowOrigin: process.env.FIXMI_ALLOW_ORIGIN || "*",
+        masterOk: true,
+        ticketsSeen: Object.keys(master.maintenanceTickets || {}).length,
+        prefsFound: !!(master.admins || {}).notifyPrefs,
+        prefs: { on: prefs0.on, testMode: prefs0.testMode, testTo: prefs0.testTo, alwaysTo: prefs0.alwaysTo, roles: prefs0.roles },
+      };
+      if (ticketId) {
+        const t = { ...((master.maintenanceTickets || {})[ticketId] || {}), ...(sent || {}), _id: ticketId };
+        const st = (master.restaurants || {})[t.storeId] || {};
+        out.ticket = {
+          id: ticketId, shortId: t.shortId || null, store: storeLabel(st),
+          knownToMaster: !!(master.maintenanceTickets || {})[ticketId],
+          subject: t.storeId ? (prefs0.testMode ? "[TEST] " : "") + subjectFor(st, t) : null,
+          recipients: t.storeId ? recipientsFor(master, t, { prefs: prefs0, event: "created", actorEmail }) : [],
+        };
+      }
+      return res.status(200).json(out);
+    }
+
+    if (event === "sendtest") {
+      const prefs0 = prefsFrom(master);
+      const known = new Set([...prefs0.testTo, ...prefs0.alwaysTo]);
+      [master.admins, master.directors, master.areaCoaches, master.repairTechnicians, master.restaurants]
+        .forEach(g => Object.values(g || {}).forEach(o => { const e = lc(o && o.email); if (e) known.add(e); }));
+      const to = [...new Set(arr(body.to).map(lc).filter(e => e.includes("@")))].filter(e => known.has(e));
+      if (!to.length) return res.status(400).json({ error: "the test address has to be someone FixMi already knows, or a test address from Settings → Email" });
+      if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+      const when = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" });
+      const pm0 = await fetch("https://api.postmarkapp.com/email/batch", {
+        method: "POST",
+        headers: { "Accept": "application/json", "Content-Type": "application/json", "X-Postmark-Server-Token": cfg.token },
+        body: JSON.stringify(to.map(e => ({
+          From: `FixMi <${cfg.from}>`, To: e,
+          Subject: "FixMi connection test",
+          TextBody: `This is a FixMi connection test sent ${when}.\n\nIf you are reading this, the whole chain works: FixMi reached the notifier, the notifier reached Postmark, and Postmark delivered as ${cfg.from}.\n\nNo ticket was involved.`,
+          HtmlBody: `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.5;color:#111827"><p><b>FixMi connection test</b> — sent ${esc(when)}.</p><p>If you are reading this, the whole chain works: FixMi reached the notifier, the notifier reached Postmark, and Postmark delivered as ${esc(cfg.from)}.</p><p style="color:#6b7280">No ticket was involved.</p></div>`,
+          MessageStream: cfg.stream, Tag: "connection-test", TrackOpens: false, TrackLinks: "None",
+        }))),
+      });
+      const out = await pm0.json().catch(() => []);
+      const list = Array.isArray(out) ? out : [out];
+      const failed = list.filter(x => x && x.ErrorCode);
+      if (!pm0.ok || failed.length) {
+        console.error("[fixmi-notify] connection test failed", pm0.status, list);
+        return res.status(200).json({ ok: false, sent: 0, status: pm0.status, to, detail: failed.length ? failed : list });
+      }
+      return res.status(200).json({ ok: true, sent: list.length, to });
+    }
 
     /* The caller just wrote this ticket, so ITS copy wins. The master is served
        through a CDN that lags up to a minute, and for a brand-new ticket it
