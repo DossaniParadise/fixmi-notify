@@ -35,55 +35,185 @@ const lc = v => String(v || "").trim().toLowerCase();
 const arr = v => Array.isArray(v) ? v : (v && typeof v === "object" ? Object.values(v) : (v ? [v] : []));
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
-/* A sign-off with no "--" in front of it is the one thing the reply parser
-   can't see. Only trimmed when what's left still says something, and only when
-   the trailing block is short — a few lines of name, company, phone. */
-function trimSignOff(text) {
-  const SIGNOFF = /^(thanks|thank you|thanks again|thankyou|regards|best|best regards|kind regards|warm regards|cheers|sincerely|respectfully|thx|many thanks|appreciate it|talk soon)[\s,.!—–-]*$/i;
-  const lines = String(text || "").split("\n");
-  for (let i = Math.max(0, lines.length - 9); i < lines.length; i++) {
-    if (!SIGNOFF.test(lines[i].trim())) continue;
-    const after = lines.slice(i + 1).filter(l => l.trim());
-    if (after.length > 5) continue;                       // too much to be a signature
-    if (after.some(l => l.trim().length > 60)) continue;  // real sentences, not a name block
-    const kept = lines.slice(0, i).join("\n").trim();
-    if (kept) return kept;
+/* ════════════════════════════════════════════════════════════════════════════
+   Pulling the actual message out of a reply.
+
+   Two jobs, done in order: remove the quoted history underneath, then remove
+   the signature block. Both are done here rather than by a library — the one
+   we used only understood "-- " and "Sent from my iPhone", which is not what a
+   corporate Outlook signature looks like, and it cost a package install plus an
+   ES-module load on every cold start.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* Lines that mean "everything from here down is the email being replied to". */
+const QUOTE_LINE = [
+  /^\s*on\b.{0,240}\bwrote\s*:\s*$/i,               // Gmail, Apple Mail, most clients
+  /^\s*on\b.{0,240}\b(wrote|schrieb|escribió|a écrit)\s*:\s*$/i,
+  /^\s*-{2,}\s*original message\s*-{2,}\s*$/i,      // Outlook, older style
+  /^\s*-{2,}\s*forwarded message\s*-{2,}\s*$/i,
+  /^\s*<[^>]+@[^>]+>\s+wrote\s*:\s*$/i,
+  /^\s*\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4}\b.{0,120}\bwrote\s*:\s*$/i,
+  /^\s*_{5,}\s*$/,                                  // Outlook's rule above the header block
+  /^\s*\*?from\s*:\s*.+\bsent\s*:/i,                // header block collapsed onto one line
+];
+/* "From:" alone is too common in ordinary writing, so it only counts as the
+   start of a quote when the next few lines carry the rest of a header block. */
+const HDR_FROM = /^\s*\*{0,2}from\s*:\s*\S/i;
+const HDR_NEXT = /^\s*\*{0,2}(sent|date|to|cc|subject|reply-to)\s*:\s*\S/i;
+
+function quoteStartsAt(lines, i) {
+  const l = lines[i];
+  if (QUOTE_LINE.some(re => re.test(l))) return true;
+  if (HDR_FROM.test(l)) {
+    for (let j = i + 1; j < Math.min(lines.length, i + 5); j++) if (HDR_NEXT.test(lines[j])) return true;
   }
-  return String(text || "").trim();
+  // "On <long date>" that wrapped onto the next line before "wrote:"
+  if (/^\s*on\b/i.test(l) && i + 1 < lines.length && /\bwrote\s*:\s*$/i.test((l + " " + lines[i + 1]).trim())) return true;
+  return false;
 }
 
-/* email-reply-parser ships as an ES module, so on Vercel's Node a plain
-   require() of it throws ERR_REQUIRE_ESM. import() loads either kind, and the
-   promise is cached so the module is only pulled in once per cold start. */
-let _parserPromise = null;
-function loadParser() {
-  if (!_parserPromise) {
-    _parserPromise = import("email-reply-parser")
-      .then(m => m.default || m)
-      .catch(e1 => {
-        try { const r = require("email-reply-parser"); return r.default || r; }   // older CJS builds
-        catch (e2) { console.warn("[fixmi-inbound] reply parser unavailable:", (e1 && e1.message) || e1); return null; }
-      });
+/** Drop the quoted history: everything from the first quote marker downwards. */
+function stripQuotes(text) {
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  let cut = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (quoteStartsAt(lines, i)) { cut = i; break; }
   }
-  return _parserPromise;
+  // A trailing run where every remaining non-blank line is ">"-quoted.
+  let runStart = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (!t) continue;
+    if (t.startsWith(">")) runStart = i; else break;
+  }
+  if (runStart >= 0 && (cut < 0 || runStart < cut)) cut = runStart;
+  const kept = (cut < 0 ? lines : lines.slice(0, cut)).join("\n");
+  return kept.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/* ---- signature detection -------------------------------------------------
+   Judged a line at a time, from the bottom up. "Strong" means a line that is
+   almost only ever found in a signature; "soft" means a line that fits in one
+   but would also fit elsewhere, so it is only removed when it sits next to
+   something strong. That pairing is what stops a two-word answer like
+   "Approved" being mistaken for a name and deleted. */
+const SIG_SIGNOFF = /^(thanks?|thank you|thanks again|thx|many thanks|much appreciated|appreciate it|appreciated|regards|best|best regards|kind regards|warm regards|warmly|cheers|sincerely|respectfully|yours truly|talk soon|take care|all the best|v\/r|br)[\s,.!;:—–-]*$/i;
+const SIG_HARD = [
+  /^\s*--\s*$/,                                     // the standard signature delimiter
+  /^\s*(-{3,}|_{3,}|={3,}|\*{3,}|•{3,})\s*$/,
+  /^\s*(sent|enviado|gesendet)\s+(from|via|desde|von)\b/i,   // Sent from my iPhone
+  /^\s*get\s+outlook\s+for\b/i,
+];
+const SIG_DISCLAIMER = /(confidential|privileged|intended (solely |only )?(for|recipient)|do not disclose|unauthori[sz]ed (use|review|disclosure)|if you (have )?received this (e-?mail|message) in error|please (notify|delete)|this (e-?mail|message) (and any|may contain))/i;
+const RE_PHONE   = /(?:\+?\d[\s().-]{0,2}){7,}\d/;
+const RE_EMAIL   = /[\w.+-]+@[\w-]+\.[\w.]{2,}/;
+const RE_URL     = /\b(?:https?:\/\/|www\.)\S+|\b[\w-]{2,}\.(?:com|net|org|io|co|us|biz)\b/i;
+const RE_LABEL   = /^\s*\(?(t|tel|telephone|p|ph|phone|m|mob|mobile|c|cell|d|direct|o|off|office|f|fax|e|email|w|web|a|addr|address)\)?\s*[:.|]\s*\S/i;
+const RE_TITLE   = /\b(director|manager|president|vice ?president|ceo|cfo|coo|cto|owner|partner|principal|founder|supervisor|coordinator|administrator|assistant|specialist|engineer|technician|analyst|officer|executive|consultant|representative|regional|district|general manager|operations|maintenance|facilities|it support|help ?desk|purchasing|accounting|payroll|human resources|franchisee?)\b/i;
+const RE_ADDRESS = /\b\d{1,6}\s+[\w.'-]+(\s+[\w.'-]+){0,4}\s+(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|ct|court|way|pkwy|parkway|hwy|highway|suite|ste|unit|floor|fl)\b|\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b/i;
+const RE_SOCIAL  = /\b(linkedin|twitter|facebook|instagram|x\.com)\b/i;
+const RE_LOGO    = /^\s*\[(cid:|image|logo)[^\]]*\]\s*$/i;
+
+/** Does this line belong to a signature on its own merits? */
+function strongSig(line, who) {
+  const t = line.trim();
+  if (!t) return false;
+  if (RE_LOGO.test(t)) return true;
+  if (RE_LABEL.test(t)) return true;
+  if (RE_EMAIL.test(t)) return true;
+  if (RE_URL.test(t)) return true;
+  if (RE_SOCIAL.test(t)) return true;
+  if (RE_ADDRESS.test(t)) return true;
+  if (RE_PHONE.test(t) && t.length < 70) return true;
+  if (RE_TITLE.test(t) && t.length < 70) return true;
+  if (who.brand && t.length < 70 && t.toLowerCase().replace(/[^a-z]/g, "").includes(who.brand)) return true;
+  if (who.names.length && t.length < 60 && who.names.some(n => t.toLowerCase().includes(n))) return true;
+  return false;
+}
+/** Plausible inside a signature, but only when something strong is nearby. */
+function softSig(line) {
+  const t = line.trim();
+  if (!t) return true;                               // blank lines ride along
+  if (t.length > 52) return false;                   // that is a sentence, not a name
+  if (/[.!?]$/.test(t) && t.split(/\s+/).length > 4) return false;
+  if (/\|/.test(t)) return true;                     // "Name | Company"
+  return /^[^a-z]*$/.test(t)                         // ALL CAPS line
+      || t.split(/\s+/).length <= 6;                 // short fragment: name, title, city
+}
+
+/**
+ * Remove the trailing signature block.
+ * `who` carries what we know about the sender — their name and the company in
+ * their email domain — because their own name appearing on a line of its own is
+ * one of the clearest signals there is.
+ */
+function stripSignature(text, who) {
+  who = who || {};
+  const names = [];
+  String(who.name || "").split(/[\s,()]+/).forEach(w => { if (w.length > 2) names.push(w.toLowerCase()); });
+  if (who.name && String(who.name).trim().length > 2) names.push(String(who.name).trim().toLowerCase());
+  const domain = String(who.email || "").split("@")[1] || "";
+  const brand = (domain.split(".")[0] || "").replace(/[^a-z]/gi, "").toLowerCase();
+  const ctx = { names, brand: brand.length > 3 ? brand : "" };
+
+  let lines = String(text || "").split("\n");
+  const keep = () => lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const before = keep();
+  if (!before) return "";
+
+  // 1. Hard markers cut everything below them, however long it runs.
+  for (let i = 0; i < lines.length; i++) {
+    if (SIG_HARD.some(re => re.test(lines[i])) || (SIG_DISCLAIMER.test(lines[i]) && i > 0)) {
+      const head = lines.slice(0, i).join("\n").trim();
+      if (head) { lines = lines.slice(0, i); break; }
+    }
+  }
+
+  /* 2. Walk up a paragraph at a time. Judging whole paragraphs rather than
+        single lines is what keeps a short message safe: "Looks good to me." is
+        its own paragraph with nothing signature-like in it, so the walk stops
+        there instead of nibbling into it. */
+  const fits = l => strongSig(l, ctx) || softSig(l) || (l.trim().length <= 90 && !/[.!?]$/.test(l.trim()));
+  let i = lines.length - 1, sawStrong = false;
+  for (;;) {
+    while (i >= 0 && !lines[i].trim()) i--;                          // trailing blanks
+    if (i < 0) break;
+    let start = i;
+    while (start >= 0 && lines[start].trim()) start--;
+    start++;
+    const para = lines.slice(start, i + 1);
+    if (para.length <= 14 && para.some(l => strongSig(l, ctx)) && para.every(fits)) {
+      sawStrong = true; i = start - 1; continue;                     // a signature block
+    }
+    if (sawStrong && para.length === 1 && SIG_SIGNOFF.test(para[0].trim())) {
+      i = start - 1; continue;                                       // the "Thanks," above it
+    }
+    break;
+  }
+  if (sawStrong) {
+    const head = lines.slice(0, i + 1).join("\n").trim();
+    if (head) lines = lines.slice(0, i + 1);
+  } else {
+    // No signature markers — still drop a bare "Thanks," on the last line.
+    let j = lines.length - 1;
+    while (j >= 0 && !lines[j].trim()) j--;
+    if (j > 0 && SIG_SIGNOFF.test(lines[j].trim())) {
+      const head = lines.slice(0, j).join("\n").trim();
+      if (head) lines = lines.slice(0, j);
+    }
+  }
+  return keep() || before;
 }
 
 /** Just the words this person typed: no quoted history, no signature. */
-async function cleanReply(payload) {
+function cleanReply(payload, who) {
   const raw = payload.TextBody || payload.StrippedTextReply || "";
-  let out = "";
-  const Parser = await loadParser();
-  if (Parser) {
-    try { out = new Parser().read(raw).getVisibleText() || ""; }
-    catch (e) { console.warn("[fixmi-inbound] parse failed, falling back", e && e.message); out = payload.StrippedTextReply || raw; }
-  } else {
-    out = payload.StrippedTextReply || raw;
-  }
-  out = trimSignOff(out);
-  // Last resort: the parser decided everything was quoted, but Postmark's own
-  // stripping found something. Better a slightly messy comment than none.
-  if (!out.trim() && payload.StrippedTextReply) out = trimSignOff(payload.StrippedTextReply);
-  return out.trim();
+  let out = stripQuotes(raw);
+  // Postmark strips the quote its own way; if ours removed everything but
+  // theirs kept something, theirs is the better starting point.
+  if (!out && payload.StrippedTextReply) out = stripQuotes(payload.StrippedTextReply);
+  out = stripSignature(out, who);
+  return out.replace(/[ \t]+$/gm, "").trim();
 }
 
 /* Machines talking to machines: out-of-office, bounces, delivery reports.
@@ -150,12 +280,13 @@ async function diagnostics(p, req, res) {
   } catch (e) { masterErr = (e && e.message) || String(e); }
 
   if (p.event === "selftest") {
+    // Proves the quote/signature stripping is the build we think it is.
     let parser = false, parserError = null;
     try {
-      const Parser = await loadParser();
-      if (!Parser) throw new Error("the module could not be loaded");
-      new Parser().read("hi");
-      parser = true;
+      const probe = cleanReply({ TextBody: "Yes please.\n\nThanks,\nSam Smith\nAcme Corp\n555-123-4567\n\nOn Mon, X wrote:\n> hello" },
+        { name: "Sam Smith", email: "sam@acme.com" });
+      parser = probe === "Yes please.";
+      if (!parser) parserError = `self-test returned ${JSON.stringify(probe)}`;
     } catch (e) { parserError = (e && e.message) || String(e); }
 
     /* Prove the write password, rather than only reporting that one is set —
@@ -208,7 +339,7 @@ async function diagnostics(p, req, res) {
     const automated = isAutomated(payload);
     const { id, how } = matchTicket(tickets, payload);
     const ticket = id ? tickets[id] : null;
-    const text = await cleanReply(payload);
+    const text = cleanReply(payload, { name: p.fromName || "", email: from });
     const known = identify(master, from);
     const by = known ? known.name : ((p.fromName || "").trim() ? `${p.fromName.trim()} (${from})` : from);
     const dupe = !!(ticket && arr(ticket.comments).some(c => c && lc(c.email) === from && String(c.text || "").trim() === text.trim()));
@@ -218,17 +349,9 @@ async function diagnostics(p, req, res) {
     let wouldEmail = null, notifyErr = null;
     if (ticket && !automated && text) {
       try {
-        const n = await fetch(`${self}/api/notify`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            secret: process.env.FIXMI_SHARED_SECRET, event: "selftest",
-            ticketId: id, forEvent: "comment", actorEmail: from,
-          }),
-        });
-        const j = await n.json().catch(() => null);
+        const j = await callNotify({ event: "selftest", ticketId: id, forEvent: "comment", actorEmail: from, _master: master }, req);
         if (j && j.ticket) wouldEmail = arr(j.ticket.recipients).map(x => `${x.email} (${x.role})`);
-        else notifyErr = (j && j.error) || `HTTP ${n.status}`;
+        else notifyErr = (j && j.error) || "no answer from the notifier";
       } catch (e) { notifyErr = (e && e.message) || String(e); }
     }
 
@@ -252,6 +375,39 @@ async function diagnostics(p, req, res) {
   return res.status(400).json({ error: "unknown diagnostic event" });
 }
 
+/* Send through /api/notify. Calling its handler in this same process is much
+   faster than an HTTP round trip to ourselves — no second cold start and no
+   second download of the master, which between them were most of the delay a
+   replier felt before their comment showed up. Falls back to the HTTP call if
+   the module can't be loaded for any reason. */
+async function callNotify(payload, req) {
+  const body = { secret: process.env.FIXMI_SHARED_SECRET, ...payload };
+  try {
+    const handler = require("./notify.js");
+    let code = 200, out = null;
+    await handler({ method: "POST", body, query: {}, headers: {} }, {
+      status(c) { code = c; return this; },
+      setHeader() {},
+      json(o) { out = o; return this; },
+      end() { return this; },
+    });
+    if (code >= 400) console.error("[fixmi-inbound] notify returned", code, out);
+    return out;
+  } catch (e) {
+    console.warn("[fixmi-inbound] in-process notify failed, falling back to HTTP:", e && e.message);
+  }
+  try {
+    const self = (process.env.FIXMI_SELF_URL || `https://${req.headers.host}`).replace(/\/$/, "");
+    const n = await fetch(`${self}/api/notify`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    return await n.json().catch(() => null);
+  } catch (e) {
+    console.error("[fixmi-inbound] comment saved but the notification failed", e && e.message);
+    return null;
+  }
+}
+
 module.exports = async (req, res) => {
   const allowOrigin = process.env.FIXMI_ALLOW_ORIGIN || "*";
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
@@ -261,6 +417,7 @@ module.exports = async (req, res) => {
   const ok = (body) => res.status(200).json(body);            // always 200: see the note up top
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
+  const t0 = Date.now();
   try {
     const p = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
 
@@ -300,6 +457,7 @@ module.exports = async (req, res) => {
     const r = await fetch(masterUrl, { headers: { accept: "application/json" } });
     if (!r.ok) return ok({ ignored: true, reason: `could not read the master (HTTP ${r.status})` });
     const master = await r.json();
+    const tRead = Date.now();
     const tickets = master[DEFAULTS.ticketsNode] || {};
 
     // No hash means someone wrote to the address directly, or forwarded it —
@@ -312,7 +470,7 @@ module.exports = async (req, res) => {
     const ticket = tickets[id];
 
     // --- the words -----------------------------------------------------------
-    const text = await cleanReply(p);
+    const text = cleanReply(p, { name: fromName, email: fromEmail });
     if (!text) return ok({ ignored: true, reason: "nothing left after removing the quoted history" });
 
     // --- don't post the same reply twice on a webhook retry ------------------
@@ -345,6 +503,7 @@ module.exports = async (req, res) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ password: writePass, updates: { [`${DEFAULTS.ticketsNode}/${id}`]: updated } }),
     });
+    const tWrite = Date.now();
     if (!w.ok) {
       const detail = await w.text().catch(() => "");
       console.error("[fixmi-inbound] write failed", w.status, detail.slice(0, 200));
@@ -352,30 +511,21 @@ module.exports = async (req, res) => {
     }
 
     // --- tell everyone else --------------------------------------------------
-    let notified = null;
-    try {
-      const self = process.env.FIXMI_SELF_URL || `https://${req.headers.host}`;
-      const n = await fetch(`${self.replace(/\/$/, "")}/api/notify`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          secret: process.env.FIXMI_SHARED_SECRET,
-          event: "comment",
-          ticketId: id,
-          ticket: updated,
-          comment: { by, text, ts: comment.ts },
-          thread: comments.slice(-25).map(c => ({ by: c.by, role: c.role, email: c.email, text: c.text, ts: c.ts })),
-          actorEmail: fromEmail,            // the replier doesn't get their own reply back
-          actorName: by,
-        }),
-      });
-      notified = await n.json().catch(() => null);
-    } catch (e) {
-      console.error("[fixmi-inbound] comment saved but the notification failed", e && e.message);
-    }
+    const notified = await callNotify({
+      event: "comment",
+      ticketId: id,
+      ticket: updated,
+      comment: { by, text, ts: comment.ts },
+      thread: comments.slice(-25).map(c => ({ by: c.by, role: c.role, email: c.email, text: c.text, ts: c.ts })),
+      actorEmail: fromEmail,              // the replier doesn't get their own reply back
+      actorName: by,
+      _master: master,
+    }, req);
 
-    console.log("[fixmi-inbound] comment added to", ticket.shortId || id, "from", fromEmail, "| emailed:", (notified && notified.to) || "none");
-    return ok({ ok: true, ticket: ticket.shortId || id, from: fromEmail, chars: text.length, notified: (notified && notified.to) || [] });
+    console.log("[fixmi-inbound] comment added to", ticket.shortId || id, "from", fromEmail,
+      "| emailed:", (notified && notified.to) || "none",
+      "| ms:", JSON.stringify({ read: tRead - t0, write: tWrite - tRead, notify: Date.now() - tWrite, total: Date.now() - t0 }));
+    return ok({ ok: true, ticket: ticket.shortId || id, from: fromEmail, chars: text.length, notified: (notified && notified.to) || [], ms: Date.now() - t0 });
   } catch (e) {
     console.error("[fixmi-inbound] crashed", e);
     return res.status(200).json({ ignored: true, error: String((e && e.message) || e) });
@@ -383,7 +533,8 @@ module.exports = async (req, res) => {
 };
 
 module.exports.cleanReply = cleanReply;
-module.exports.trimSignOff = trimSignOff;
+module.exports.stripQuotes = stripQuotes;
+module.exports.stripSignature = stripSignature;
 module.exports.isAutomated = isAutomated;
 module.exports.identify = identify;
 module.exports.matchTicket = matchTicket;
