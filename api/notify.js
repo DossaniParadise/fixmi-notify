@@ -113,12 +113,22 @@ function recipientsFor(master, ticket, opts) {
   return [...out.values()];
 }
 
+/* Store names in FindMi often already carry the number ("Burger King #11460
+   Bonham"), and some storeNumber values arrive with a "#" already on them.
+   Naming a store in one place stops subjects like "Store ##11460 — Burger
+   King #11460 Bonham". */
+function storeLabel(store) {
+  const name = String(store.storeName || "Store").trim();
+  const num = String(store.storeNumber || "").replace(/^#+/, "").trim();
+  if (!num || name.includes(num)) return name;
+  return `${name} #${num}`;
+}
 function subjectFor(store, ticket) {
-  return `[${ticket.shortId || "Ticket"}] Store #${store.storeNumber || "?"} — ${store.storeName || "Store"}`;
+  return `[${ticket.shortId || "Ticket"}] ${storeLabel(store)}`;
 }
 
 function headlineFor(event, store, ticket, prevStatus) {
-  const who = `${store.storeName || "Store"} #${store.storeNumber || ""}`.trim();
+  const who = storeLabel(store);
   if (event === "created") return `${who} has a new ticket open.`;
   const to = STATUS_LABEL[ticket.status] || ticket.status || "updated";
   const from = STATUS_LABEL[prevStatus] || prevStatus;
@@ -130,7 +140,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName }) {
   const headline = headlineFor(event, store, ticket, prevStatus);
   const photos = arr(ticket.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6);
   const facts = [
-    ["Store", `${store.storeName || "—"} &nbsp;#${store.storeNumber || ""}`],
+    ["Store", storeLabel(store)],
     ["Status", STATUS_LABEL[ticket.status] || ticket.status || "—"],
     ["Priority", PRIORITY_LABEL[ticket.priority] || "Normal"],
     ["Category", [ticket.category, ticket.subcategory].filter(Boolean).join(" › ")],
@@ -146,7 +156,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName }) {
   <tr><td style="padding:24px 24px 6px"><div style="font-size:19px;font-weight:700;line-height:1.35">${esc(headline)}</div>
     <div style="font-size:14px;color:#6b7280;margin-top:6px">See details below.</div></td></tr>
   <tr><td style="padding:10px 24px 0"><table role="presentation" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7">
-    ${facts.map(([k, v]) => `<tr><td style="color:#6b7280;padding-right:16px;white-space:nowrap">${esc(k)}</td><td>${k === "Store" ? v : esc(v)}</td></tr>`).join("")}
+    ${facts.map(([k, v]) => `<tr><td style="color:#6b7280;padding-right:16px;white-space:nowrap">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
   </table></td></tr>
   <tr><td style="padding:18px 24px 0">
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Issue</div>
@@ -158,7 +168,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName }) {
 
   const text = [
     headline, "",
-    ...facts.map(([k, v]) => `${k}: ${String(v).replace(/&nbsp;/g, " ").replace(/<[^>]+>/g, "")}`),
+    ...facts.map(([k, v]) => `${k}: ${v}`),
     "", "ISSUE", ticket.description || "No description",
     ...(photos.length ? ["", "PHOTOS", ...photos] : []),
     "", `See more on FixMi: ${url}`,
@@ -241,7 +251,7 @@ module.exports = async (req, res) => {
 
     if (cfg.dryRun) {
       console.log("[fixmi-notify] DRY RUN", { event, subject, url, to: people });
-      return res.status(200).json({ sent: 0, dryRun: true, testMode: prefs.testMode, subject, to: people });
+      return res.status(200).json({ sent: 0, dryRun: true, testMode: prefs.testMode, subject, to: people.map(p => p.email) });
     }
 
     const pm = await fetch("https://api.postmarkapp.com/email/batch", {
@@ -275,4 +285,5 @@ module.exports.recipientsFor = recipientsFor;
 module.exports.prefsFrom = prefsFrom;
 module.exports.bodyFor = bodyFor;
 module.exports.subjectFor = subjectFor;
+module.exports.storeLabel = storeLabel;
 module.exports.headlineFor = headlineFor;
