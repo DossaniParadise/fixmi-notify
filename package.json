@@ -1,10 +1,9 @@
 {
   "name": "fixmi-notify",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "Emails a store's Director, District Manager and General Manager when a FixMi ticket changes, and turns email replies back into ticket comments.",
-  "engines": { "node": ">=18" },
-  "dependencies": {
-    "email-reply-parser": "^2.3.9"
+  "description": "Emails a store's Director, District Manager and General Manager when a FixMi ticket changes, and turns email replies back into ticket comments. No dependencies \u2014 nothing to install, so cold starts stay fast.",
+  "engines": {
+    "node": ">=18"
   }
 }
