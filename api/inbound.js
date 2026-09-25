@@ -149,6 +149,16 @@ function softSig(line) {
  */
 function stripSignature(text, who) {
   who = who || {};
+  /* Anything typed into "Also cut replies at these lines" in Settings → Email.
+     Matched as a whole line, ignoring case and trailing punctuation, so a new
+     house style can be handled without waiting on a redeploy. */
+  const extra = (who.cutLines || []).map(x => String(x || "").trim().toLowerCase().replace(/[\s,.!;:—–-]+$/, "")).filter(Boolean);
+  const isSignOff = line => {
+    const t = String(line || "").trim();
+    if (SIG_SIGNOFF.test(t)) return true;
+    const bare = t.toLowerCase().replace(/[\s,.!;:—–-]+$/, "");
+    return !!bare && extra.includes(bare);
+  };
   const names = [];
   String(who.name || "").split(/[\s,()]+/).forEach(w => { if (w.length > 2) names.push(w.toLowerCase()); });
   if (who.name && String(who.name).trim().length > 2) names.push(String(who.name).trim().toLowerCase());
@@ -161,7 +171,28 @@ function stripSignature(text, who) {
   const before = keep();
   if (!before) return "";
 
-  // 1. Hard markers cut everything below them, however long it runs.
+  /* 1. A sign-off on a line of its own ends the message. Every Dossani
+        signature opens with "Thank You," and runs straight on from the last
+        sentence with no blank line between them, so there is no block to spot —
+        the sign-off itself is the boundary, and everything below it goes.
+
+        The one exception is a sign-off with nothing signature-like under it but
+        real writing instead ("Thanks," then another question) — that is someone
+        still talking, so it is left alone and the checks below handle it. */
+  for (let i = 0; i < lines.length; i++) {
+    if (!isSignOff(lines[i])) continue;
+    const head = lines.slice(0, i).join("\n").trim();
+    if (!head) continue;                                   // the whole reply is "Thanks!"
+    const after = lines.slice(i + 1);
+    const markers = after.some(l =>
+      strongSig(l, ctx) || SIG_DISCLAIMER.test(l) || SIG_HARD.some(re => re.test(l)));
+    const stillTalking = after.some(l => l.includes("?") || l.trim().length > 60);
+    if (!markers && stillTalking) continue;
+    lines = lines.slice(0, i);
+    break;
+  }
+
+  // 2. Hard markers cut everything below them, however long they run.
   for (let i = 0; i < lines.length; i++) {
     if (SIG_HARD.some(re => re.test(lines[i])) || (SIG_DISCLAIMER.test(lines[i]) && i > 0)) {
       const head = lines.slice(0, i).join("\n").trim();
@@ -169,7 +200,7 @@ function stripSignature(text, who) {
     }
   }
 
-  /* 2. Walk up a paragraph at a time. Judging whole paragraphs rather than
+  /* 3. Walk up a paragraph at a time. Judging whole paragraphs rather than
         single lines is what keeps a short message safe: "Looks good to me." is
         its own paragraph with nothing signature-like in it, so the walk stops
         there instead of nibbling into it. */
@@ -185,7 +216,7 @@ function stripSignature(text, who) {
     if (para.length <= 14 && para.some(l => strongSig(l, ctx)) && para.every(fits)) {
       sawStrong = true; i = start - 1; continue;                     // a signature block
     }
-    if (sawStrong && para.length === 1 && SIG_SIGNOFF.test(para[0].trim())) {
+    if (sawStrong && para.length === 1 && isSignOff(para[0])) {
       i = start - 1; continue;                                       // the "Thanks," above it
     }
     break;
@@ -197,7 +228,7 @@ function stripSignature(text, who) {
     // No signature markers — still drop a bare "Thanks," on the last line.
     let j = lines.length - 1;
     while (j >= 0 && !lines[j].trim()) j--;
-    if (j > 0 && SIG_SIGNOFF.test(lines[j].trim())) {
+    if (j > 0 && isSignOff(lines[j])) {
       const head = lines.slice(0, j).join("\n").trim();
       if (head) lines = lines.slice(0, j);
     }
@@ -206,6 +237,12 @@ function stripSignature(text, who) {
 }
 
 /** Just the words this person typed: no quoted history, no signature. */
+function cutLinesFrom(master) {
+  const raw = ((master && master.admins) || {}).notifyPrefs;
+  const v = raw && raw.cutLines;
+  return (Array.isArray(v) ? v : String(v || "").split("\n")).map(x => String(x || "").trim()).filter(Boolean);
+}
+
 function cleanReply(payload, who) {
   const raw = payload.TextBody || payload.StrippedTextReply || "";
   let out = stripQuotes(raw);
@@ -339,7 +376,7 @@ async function diagnostics(p, req, res) {
     const automated = isAutomated(payload);
     const { id, how } = matchTicket(tickets, payload);
     const ticket = id ? tickets[id] : null;
-    const text = cleanReply(payload, { name: p.fromName || "", email: from });
+    const text = cleanReply(payload, { name: p.fromName || "", email: from, cutLines: cutLinesFrom(master) });
     const known = identify(master, from);
     const by = known ? known.name : ((p.fromName || "").trim() ? `${p.fromName.trim()} (${from})` : from);
     const dupe = !!(ticket && arr(ticket.comments).some(c => c && lc(c.email) === from && String(c.text || "").trim() === text.trim()));
@@ -367,6 +404,13 @@ async function diagnostics(p, req, res) {
       text,
       rawChars: String(p.text || "").length,
       keptChars: text.length,
+      removed: (() => {
+        const rawNorm = String(p.text || "").replace(/\r\n?/g, "\n");
+        if (!text) return rawNorm.trim();
+        const last = text.split("\n").pop();
+        const at = rawNorm.lastIndexOf(last);
+        return at < 0 ? "" : rawNorm.slice(at + last.length).trim();
+      })(),
       duplicate: dupe,
       wouldEmail, notifyErr,
     });
@@ -470,7 +514,7 @@ module.exports = async (req, res) => {
     const ticket = tickets[id];
 
     // --- the words -----------------------------------------------------------
-    const text = cleanReply(p, { name: fromName, email: fromEmail });
+    const text = cleanReply(p, { name: fromName, email: fromEmail, cutLines: cutLinesFrom(master) });
     if (!text) return ok({ ignored: true, reason: "nothing left after removing the quoted history" });
 
     // --- don't post the same reply twice on a webhook retry ------------------
