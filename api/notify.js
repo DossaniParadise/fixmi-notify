@@ -24,7 +24,8 @@
  *   FIXMI_MASTER_URL      optional   default the dpm-alignment endpoint
  *   FIXMI_ALLOW_ORIGIN    optional   default "*" — set to "https://dossaniparadise.github.io" to lock it down
  *   FIXMI_STREAM          optional   default "outbound" (Postmark's Default Transactional Stream)
- *   FIXMI_SKIP_ACTOR      optional   "1" to skip whoever caused the change
+ *
+ * Whoever performed the action is never emailed about their own change.
  *
  * WHO ACTUALLY GETS EMAILED is not set here — it is edited in FixMi under
  * Settings → Email and stored in the master at admins/notifyPrefs. This
@@ -61,10 +62,12 @@ function storeCoachIds(store) {
   return [...new Set(ids.filter(Boolean))];
 }
 
+const EVENTS = ["created", "status", "comment"];
 const PREF_DEFAULTS = {
   on: true,
-  roles: { director: { created: true, status: true }, dm: { created: true, status: true }, gm: { created: true, status: true },
-           tech: { created: false, status: false }, reporter: { created: false, status: false } },
+  roles: { director: { created: true, status: true, comment: true }, dm: { created: true, status: true, comment: true },
+           gm: { created: true, status: true, comment: true },
+           tech: { created: false, status: false, comment: false }, reporter: { created: false, status: false, comment: false } },
   testMode: false, testTo: [], alwaysTo: [],
 };
 /** Read Settings → Email out of the master, falling back to sane defaults. */
@@ -75,7 +78,12 @@ function prefsFrom(master) {
     if (typeof raw.on === "boolean") p.on = raw.on;
     if (typeof raw.testMode === "boolean") p.testMode = raw.testMode;
     if (raw.roles && typeof raw.roles === "object")
-      Object.keys(p.roles).forEach(k => { const v = raw.roles[k]; if (v && typeof v === "object") p.roles[k] = { created: !!v.created, status: !!v.status }; });
+      Object.keys(p.roles).forEach(k => {
+        const v = raw.roles[k]; if (!v || typeof v !== "object") return;
+        // A record saved before comments existed has no `comment` key — keep the
+        // default for it rather than reading undefined as "off".
+        EVENTS.forEach(e => { if (v[e] !== undefined) p.roles[k][e] = !!v[e]; });
+      });
     ["testTo", "alwaysTo"].forEach(k => {
       const v = raw[k];
       p[k] = (Array.isArray(v) ? v : String(v || "").split(/[,;\s]+/)).map(lc).filter(e => e.includes("@"));
@@ -109,7 +117,8 @@ function recipientsFor(master, ticket, opts) {
   if (prefs.testMode) return prefs.testTo.map(e => ({ email: e, name: e, role: "Test" }));
 
   prefs.alwaysTo.forEach(e => { if (!out.has(e)) out.set(e, { email: e, name: e, role: "Always copied" }); });
-  if (opts.skipActor && opts.actorEmail) out.delete(lc(opts.actorEmail));
+  // Never tell someone about the thing they just did.
+  if (opts.actorEmail) out.delete(lc(opts.actorEmail));
   return [...out.values()];
 }
 
@@ -127,26 +136,28 @@ function subjectFor(store, ticket) {
   return `[${ticket.shortId || "Ticket"}] ${storeLabel(store)}`;
 }
 
-function headlineFor(event, store, ticket, prevStatus) {
+function headlineFor(event, store, ticket, prevStatus, comment) {
   const who = storeLabel(store);
   if (event === "created") return `${who} has a new ticket open.`;
+  if (event === "comment") return `${who} — new comment from ${(comment && comment.by) || "someone"}.`;
   const to = STATUS_LABEL[ticket.status] || ticket.status || "updated";
   const from = STATUS_LABEL[prevStatus] || prevStatus;
   return from ? `${who} — ticket moved from ${from} to ${to}.` : `${who} — ticket moved to ${to}.`;
 }
 
-function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName }) {
+function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment }) {
   const url = `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticket._id || "")}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
-  const headline = headlineFor(event, store, ticket, prevStatus);
+  const headline = headlineFor(event, store, ticket, prevStatus, comment);
   const photos = arr(ticket.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6);
+  const cPhotos = comment ? arr(comment.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6) : [];
   const facts = [
     ["Store", storeLabel(store)],
-    ["Status", STATUS_LABEL[ticket.status] || ticket.status || "—"],
-    ["Priority", PRIORITY_LABEL[ticket.priority] || "Normal"],
-    ["Category", [ticket.category, ticket.subcategory].filter(Boolean).join(" › ")],
-    ["Reported by", ticket.createdByName || ticket.createdBy || "—"],
-    event === "created" ? null : ["Changed by", actorName || "—"],
-  ].filter(Boolean).filter(([, v]) => v && v !== "—" || true);
+    ["Status", STATUS_LABEL[ticket.status] || ticket.status],
+    ["Priority", ticket.priority ? (PRIORITY_LABEL[ticket.priority] || ticket.priority) : "Normal"],
+    ["Category", ticket.categoryLabel || [ticket.category, ticket.subcategory].filter(Boolean).join(" › ")],
+    ["Reported by", ticket.createdByName || ticket.createdBy],
+    event === "created" ? null : [event === "comment" ? "Comment by" : "Changed by", (comment && comment.by) || actorName],
+  ].filter(Boolean).filter(([, v]) => String(v == null ? "" : v).trim() !== "");   // a blank row is noise, not "—"
 
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827">
@@ -162,6 +173,11 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName }) {
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Issue</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px">${esc(ticket.description || "No description")}</div></td></tr>
   ${photos.length ? `<tr><td style="padding:14px 24px 0">${photos.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="160" alt="Ticket photo" style="width:160px;max-width:100%;height:auto;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</td></tr>` : ""}
+  ${comment ? `<tr><td style="padding:18px 24px 0">
+    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">New comment · ${esc(comment.by || "")}</div>
+    <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;border-left:3px solid #1d76bb;padding:6px 14px">${esc(comment.text || "")}</div>
+    ${cPhotos.length ? `<div style="margin-top:10px">${cPhotos.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="160" alt="Comment photo" style="width:160px;max-width:100%;height:auto;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</div>` : ""}
+  </td></tr>` : ""}
   <tr><td style="padding:24px"><a href="${esc(url)}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px">See more on FixMi →</a></td></tr>
   <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af">Dossani Paradise · Repair &amp; Maintenance · Ticket ${esc(ticket.shortId || "")}</td></tr>
 </table></td></tr></table></body></html>`;
@@ -171,6 +187,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName }) {
     ...facts.map(([k, v]) => `${k}: ${v}`),
     "", "ISSUE", ticket.description || "No description",
     ...(photos.length ? ["", "PHOTOS", ...photos] : []),
+    ...(comment ? ["", `NEW COMMENT · ${comment.by || ""}`, comment.text || "", ...cPhotos] : []),
     "", `See more on FixMi: ${url}`,
     "", "--", "Dossani Paradise · Repair & Maintenance",
   ].join("\n");
@@ -188,12 +205,12 @@ module.exports = async (req, res) => {
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-    const { secret, event, ticketId, ticket: sent, prevStatus, actorEmail, actorName } = body;
+    const { secret, event, ticketId, ticket: sent, prevStatus, actorEmail, actorName, comment } = body;
 
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
     if (secret !== want) return res.status(401).json({ error: "bad secret" });
-    if (event !== "created" && event !== "status") return res.status(400).json({ error: "event must be 'created' or 'status'" });
+    if (!EVENTS.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
     if (!ticketId) return res.status(400).json({ error: "ticketId is required" });
 
     const cfg = {
@@ -202,7 +219,6 @@ module.exports = async (req, res) => {
       appUrl: process.env.FIXMI_APP_URL || DEFAULTS.appUrl,
       masterUrl: process.env.FIXMI_MASTER_URL || DEFAULTS.masterUrl,
       stream: process.env.FIXMI_STREAM || DEFAULTS.stream,
-      skipActor: process.env.FIXMI_SKIP_ACTOR === "1",
       dryRun: process.env.FIXMI_DRY_RUN === "1",
     };
     if (!cfg.token && !cfg.dryRun) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
@@ -214,24 +230,31 @@ module.exports = async (req, res) => {
     if (!r.ok) return res.status(502).json({ error: `could not read the alignment master (HTTP ${r.status})` });
     const master = await r.json();
 
+    /* The caller just wrote this ticket, so ITS copy wins. The master is served
+       through a CDN that lags up to a minute, and for a brand-new ticket it
+       usually has nothing at all — which is exactly why the first emails went
+       out with no description, category, photos or reporter. Blank values never
+       overwrite a good one from the master. */
     const fromMaster = (master.maintenanceTickets || {})[ticketId];
-    const ticket = { ...(sent || {}), ...(fromMaster || {}), _id: ticketId };
-    if (sent && sent.status) ticket.status = sent.status;          // caller's write is the freshest
-    if (sent && sent.shareToken) ticket.shareToken = sent.shareToken;
+    const fresh = {};
+    Object.entries(sent || {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") fresh[k] = v;
+    });
+    const ticket = { ...(fromMaster || {}), ...fresh, _id: ticketId };
     if (!ticket.storeId) return res.status(404).json({ error: "ticket has no storeId — is the id right?" });
 
     const prefs = prefsFrom(master);
     if (!prefs.on) return res.status(200).json({ sent: 0, reason: "notifications are switched off in Settings → Email" });
 
     const store = (master.restaurants || {})[ticket.storeId] || {};
-    const people = recipientsFor(master, ticket, { prefs, event, skipActor: cfg.skipActor, actorEmail });
+    const people = recipientsFor(master, ticket, { prefs, event, actorEmail });
     if (!people.length) return res.status(200).json({
       sent: 0,
       reason: prefs.testMode ? "test mode is on but no test addresses are set"
                              : "nobody is set to receive this event — check Settings → Email, and that these people have emails in FindMi",
     });
 
-    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName });
+    const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment });
     const subject = (prefs.testMode ? "[TEST] " : "") + subjectFor(store, ticket);
     const threadId = `<fixmi-${ticketId}@dossaniparadise.com>`;    // same on every mail about this ticket → clients thread them
 
