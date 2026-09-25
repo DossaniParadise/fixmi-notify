@@ -24,8 +24,13 @@
  *   FIXMI_MASTER_URL      optional   default the dpm-alignment endpoint
  *   FIXMI_ALLOW_ORIGIN    optional   default "*" — set to "https://dossaniparadise.github.io" to lock it down
  *   FIXMI_STREAM          optional   default "outbound" (Postmark's Default Transactional Stream)
- *   FIXMI_CC_REPORTER     optional   "1" to also email whoever filed the ticket
  *   FIXMI_SKIP_ACTOR      optional   "1" to skip whoever caused the change
+ *
+ * WHO ACTUALLY GETS EMAILED is not set here — it is edited in FixMi under
+ * Settings → Email and stored in the master at admins/notifyPrefs. This
+ * function reads that record on every send, so changing it takes effect
+ * immediately with no redeploy. If the record is missing, the fallback is
+ * Director + District Manager + General Manager on both events.
  *   FIXMI_DRY_RUN         optional   "1" to log instead of send (nothing leaves Postmark)
  */
 
@@ -56,22 +61,54 @@ function storeCoachIds(store) {
   return [...new Set(ids.filter(Boolean))];
 }
 
-/** Director + District Manager(s) + General Manager for this store. */
+const PREF_DEFAULTS = {
+  on: true,
+  roles: { director: { created: true, status: true }, dm: { created: true, status: true }, gm: { created: true, status: true },
+           tech: { created: false, status: false }, reporter: { created: false, status: false } },
+  testMode: false, testTo: [], alwaysTo: [],
+};
+/** Read Settings → Email out of the master, falling back to sane defaults. */
+function prefsFrom(master) {
+  const raw = (master.admins || {}).notifyPrefs;
+  const p = JSON.parse(JSON.stringify(PREF_DEFAULTS));
+  if (raw && typeof raw === "object") {
+    if (typeof raw.on === "boolean") p.on = raw.on;
+    if (typeof raw.testMode === "boolean") p.testMode = raw.testMode;
+    if (raw.roles && typeof raw.roles === "object")
+      Object.keys(p.roles).forEach(k => { const v = raw.roles[k]; if (v && typeof v === "object") p.roles[k] = { created: !!v.created, status: !!v.status }; });
+    ["testTo", "alwaysTo"].forEach(k => {
+      const v = raw[k];
+      p[k] = (Array.isArray(v) ? v : String(v || "").split(/[,;\s]+/)).map(lc).filter(e => e.includes("@"));
+    });
+  }
+  return p;
+}
+
+/** Everyone who should get this particular email, per Settings → Email. */
 function recipientsFor(master, ticket, opts) {
+  const { prefs, event } = opts;
   const store = (master.restaurants || {})[ticket.storeId] || {};
   const out = new Map();                                   // email → {email, name, role}
-  const put = (email, name, role) => {
+  const put = (email, name, role, key) => {
+    if (key && !(prefs.roles[key] || {})[event]) return;   // this role is switched off for this event
     const e = lc(email);
     if (e && e.includes("@") && !out.has(e)) out.set(e, { email: e, name: name || e, role });
   };
   const dir = (master.directors || {})[store.assignedDirectorId];
-  if (dir) put(dir.email, dir.name, "Director");
+  if (dir) put(dir.email, dir.name, "Director", "director");
   storeCoachIds(store).forEach(id => {
     const dm = (master.areaCoaches || {})[id];
-    if (dm) put(dm.email, dm.name, "District Manager");
+    if (dm) put(dm.email, dm.name, "District Manager", "dm");
   });
-  put(store.email, store.storeManager || store.storeName, "General Manager");
-  if (opts.ccReporter) put(ticket.createdBy, ticket.createdByName, "Reported by");
+  put(store.email, store.storeManager || store.storeName, "General Manager", "gm");
+  const tech = (master.repairTechnicians || {})[ticket.assignedTechId];
+  if (tech) put(tech.email, tech.name, "Assigned tech", "tech");
+  put(ticket.createdBy, ticket.createdByName, "Reported by", "reporter");
+
+  // Test mode replaces the whole list — nobody real is emailed.
+  if (prefs.testMode) return prefs.testTo.map(e => ({ email: e, name: e, role: "Test" }));
+
+  prefs.alwaysTo.forEach(e => { if (!out.has(e)) out.set(e, { email: e, name: e, role: "Always copied" }); });
   if (opts.skipActor && opts.actorEmail) out.delete(lc(opts.actorEmail));
   return [...out.values()];
 }
@@ -155,7 +192,6 @@ module.exports = async (req, res) => {
       appUrl: process.env.FIXMI_APP_URL || DEFAULTS.appUrl,
       masterUrl: process.env.FIXMI_MASTER_URL || DEFAULTS.masterUrl,
       stream: process.env.FIXMI_STREAM || DEFAULTS.stream,
-      ccReporter: process.env.FIXMI_CC_REPORTER === "1",
       skipActor: process.env.FIXMI_SKIP_ACTOR === "1",
       dryRun: process.env.FIXMI_DRY_RUN === "1",
     };
@@ -174,12 +210,19 @@ module.exports = async (req, res) => {
     if (sent && sent.shareToken) ticket.shareToken = sent.shareToken;
     if (!ticket.storeId) return res.status(404).json({ error: "ticket has no storeId — is the id right?" });
 
+    const prefs = prefsFrom(master);
+    if (!prefs.on) return res.status(200).json({ sent: 0, reason: "notifications are switched off in Settings → Email" });
+
     const store = (master.restaurants || {})[ticket.storeId] || {};
-    const people = recipientsFor(master, ticket, { ccReporter: cfg.ccReporter, skipActor: cfg.skipActor, actorEmail });
-    if (!people.length) return res.status(200).json({ sent: 0, reason: "no Director, DM or GM email on this store" });
+    const people = recipientsFor(master, ticket, { prefs, event, skipActor: cfg.skipActor, actorEmail });
+    if (!people.length) return res.status(200).json({
+      sent: 0,
+      reason: prefs.testMode ? "test mode is on but no test addresses are set"
+                             : "nobody is set to receive this event — check Settings → Email, and that these people have emails in FindMi",
+    });
 
     const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName });
-    const subject = subjectFor(store, ticket);
+    const subject = (prefs.testMode ? "[TEST] " : "") + subjectFor(store, ticket);
     const threadId = `<fixmi-${ticketId}@dossaniparadise.com>`;    // same on every mail about this ticket → clients thread them
 
     const messages = people.map(p => ({
@@ -198,7 +241,7 @@ module.exports = async (req, res) => {
 
     if (cfg.dryRun) {
       console.log("[fixmi-notify] DRY RUN", { event, subject, url, to: people });
-      return res.status(200).json({ sent: 0, dryRun: true, subject, to: people });
+      return res.status(200).json({ sent: 0, dryRun: true, testMode: prefs.testMode, subject, to: people });
     }
 
     const pm = await fetch("https://api.postmarkapp.com/email/batch", {
@@ -219,6 +262,7 @@ module.exports = async (req, res) => {
       sent: list.length - failed.length,
       failed: failed.map((f, i) => ({ to: (people[i] || {}).email, code: f.ErrorCode, message: f.Message })),
       to: people.map(p => p.email),
+      testMode: prefs.testMode,
       subject,
     });
   } catch (e) {
@@ -228,7 +272,7 @@ module.exports = async (req, res) => {
 };
 
 module.exports.recipientsFor = recipientsFor;
+module.exports.prefsFrom = prefsFrom;
 module.exports.bodyFor = bodyFor;
 module.exports.subjectFor = subjectFor;
 module.exports.headlineFor = headlineFor;
-
