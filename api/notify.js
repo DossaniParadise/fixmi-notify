@@ -69,7 +69,11 @@ const PREF_DEFAULTS = {
            gm: { created: true, status: true, comment: true },
            tech: { created: false, status: false, comment: false }, reporter: { created: false, status: false, comment: false } },
   testMode: false, testTo: [], alwaysTo: [],
+  /* Which priorities each role/event pair actually wants. Absent means all
+     three, so every record saved before this existed keeps behaving the same. */
+  pri: {},
 };
+const PRIORITIES = ["emergency", "urgent", "normal"];
 /** Read Settings → Email out of the master, falling back to sane defaults. */
 function prefsFrom(master) {
   const raw = (master.admins || {}).notifyPrefs;
@@ -84,6 +88,16 @@ function prefsFrom(master) {
         // default for it rather than reading undefined as "off".
         EVENTS.forEach(e => { if (v[e] !== undefined) p.roles[k][e] = !!v[e]; });
       });
+    if (raw.pri && typeof raw.pri === "object") {
+      Object.keys(p.roles).forEach(role => {
+        const r = raw.pri[role]; if (!r || typeof r !== "object") return;
+        p.pri[role] = {};
+        EVENTS.forEach(e => {
+          const v = r[e];
+          if (Array.isArray(v)) p.pri[role][e] = v.map(lc).filter(x => PRIORITIES.includes(x));
+        });
+      });
+    }
     ["testTo", "alwaysTo"].forEach(k => {
       const v = raw[k];
       p[k] = (Array.isArray(v) ? v : String(v || "").split(/[,;\s]+/)).map(lc).filter(e => e.includes("@"));
@@ -97,8 +111,17 @@ function recipientsFor(master, ticket, opts) {
   const { prefs, event } = opts;
   const store = (master.restaurants || {})[ticket.storeId] || {};
   const out = new Map();                                   // email → {email, name, role}
+  /* Blank priority counts as Normal, and a pref that was never set counts as
+     "all of them" — so nobody silently stops getting email because a record
+     predates this setting. */
+  const pri = lc(ticket.priority) || "normal";
+  const priOk = key => {
+    const list = ((prefs.pri || {})[key] || {})[event];
+    return !Array.isArray(list) || list.includes(pri);
+  };
   const put = (email, name, role, key) => {
     if (key && !(prefs.roles[key] || {})[event]) return;   // this role is switched off for this event
+    if (key && !priOk(key)) return;                        // ...or off for this priority
     const e = lc(email);
     if (e && e.includes("@") && !out.has(e)) out.set(e, { email: e, name: name || e, role });
   };
@@ -113,11 +136,17 @@ function recipientsFor(master, ticket, opts) {
   if (tech) put(tech.email, tech.name, "Assigned tech", "tech");
   put(ticket.createdBy, ticket.createdByName, "Reported by", "reporter");
 
-  // Test mode replaces the whole list — nobody real is emailed.
-  if (prefs.testMode) return prefs.testTo.map(e => ({ email: e, name: e, role: "Test" }));
-
-  prefs.alwaysTo.forEach(e => { if (!out.has(e)) out.set(e, { email: e, name: e, role: "Always copied" }); });
   // Never tell someone about the thing they just did.
+  if (opts.actorEmail) out.delete(lc(opts.actorEmail));
+
+  /* Test mode replaces the whole list — nobody real is emailed. It still
+     respects an empty list, so switching a priority off really does go quiet
+     in testing instead of quietly still arriving. */
+  if (prefs.testMode) {
+    if (!out.size && !prefs.alwaysTo.length) return [];
+    return prefs.testTo.map(e => ({ email: e, name: e, role: "Test" }));
+  }
+  prefs.alwaysTo.forEach(e => { if (!out.has(e)) out.set(e, { email: e, name: e, role: "Always copied" }); });
   if (opts.actorEmail) out.delete(lc(opts.actorEmail));
   return [...out.values()];
 }
@@ -174,6 +203,22 @@ function fmtWhen(ts) {
   if (!n) return "";
   return new Date(n).toLocaleString("en-US", { timeZone: "America/Chicago", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
+/* Longer form, with the year, for the ticket's own opening date — a comment
+   from this morning reads fine as "Sep 28, 9:14 AM", but a ticket that has been
+   open since the spring needs to say so. */
+function fmtDay(ts) {
+  const n = Number(ts);
+  if (!n) return "";
+  return new Date(n).toLocaleString("en-US", { timeZone: "America/Chicago", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+}
+/** "3 days" — how long a ticket has been sitting there. */
+function ageOf(ts) {
+  const n = Number(ts); if (!n) return "";
+  const d = Math.floor((Date.now() - n) / 86400000);
+  if (d <= 0) return "today";
+  if (d === 1) return "1 day";
+  return `${d} days`;
+}
 function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment, wouldHaveGoneTo, extra, thread, canReply }) {
   const url = `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticket._id || "")}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
   const headline = headlineFor(event, store, ticket, prevStatus, comment, extra);
@@ -211,6 +256,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     ["Assigned to", assignee],
     ticket.status === "waiting" ? ["Waiting on", ticket.waitingReason] : null,
     ["Reported by", ticket.createdByName || ticket.createdBy],
+    ["Opened", ticket.createdAt ? `${fmtDay(ticket.createdAt)}  (${ageOf(ticket.createdAt)} ago)` : ""],
     event === "created" ? null : [event === "comment" ? "Comment by" : "Changed by", (comment && comment.by) || actorName],
   ].filter(Boolean).filter(([, v]) => String(v == null ? "" : v).trim() !== "");   // a blank row is noise, not "—"
 
@@ -228,7 +274,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     ${facts.map(([k, v]) => `<tr><td style="color:#6b7280;padding-right:16px;white-space:nowrap">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
   </table></td></tr>
   <tr><td style="padding:18px 24px 0">
-    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Issue</div>
+    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Issue${ticket.createdAt ? ` <span style="font-weight:400;text-transform:none;letter-spacing:0">· ${esc(ticket.createdByName || ticket.createdBy || "")} · ${esc(fmtDay(ticket.createdAt))}</span>` : ""}</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px">${esc(ticket.description || "No description")}</div></td></tr>
   ${photos.length ? `<tr><td style="padding:14px 24px 0">${photos.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="160" alt="Ticket photo" style="width:160px;max-width:100%;height:auto;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</td></tr>` : ""}
   ${closeNote ? `<tr><td style="padding:18px 24px 0">
@@ -263,6 +309,264 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
   return { html, text, url };
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+   WEEKLY SUMMARIES
+
+   Three different emails, because three different people need three different
+   things on a Monday morning:
+
+     gm  — one store, every open ticket in full, each with a Yes/No button so
+           the manager can tell us in one click whether it is still a problem.
+     dm  — their whole patch, grouped by store, subject lines only.
+     do  — a league table: how many are open at each store, worst first.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+const OPEN_STATUSES = ["unassigned", "assigned", "dispatched", "waiting", "in_progress", "finished"];
+const PRI_RANK = { emergency: 0, urgent: 1, normal: 2 };
+
+function openTicketsFor(master, storeId) {
+  return Object.entries(master.maintenanceTickets || {})
+    .filter(([, t]) => t && t.storeId === storeId && OPEN_STATUSES.includes(t.status))
+    .map(([id, t]) => ({ ...t, _id: id }))
+    .sort((a, b) => (PRI_RANK[a.priority] === undefined ? 2 : PRI_RANK[a.priority]) - (PRI_RANK[b.priority] === undefined ? 2 : PRI_RANK[b.priority])
+      || (a.createdAt || 0) - (b.createdAt || 0));
+}
+
+/* The Yes/No links have to survive being forwarded, sat in an inbox for a week
+   and clicked from a phone with no login. They are signed with the shared
+   secret so the ticket id and the answer can't be edited into something else,
+   and they carry who was asked, so the comment is attributed properly. */
+function answerSig(ticketId, answer, email) {
+  return require("crypto").createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
+    .update(`${ticketId}|${answer}|${lc(email)}`).digest("hex").slice(0, 32);
+}
+function answerUrl(base, ticketId, answer, email) {
+  const q = new URLSearchParams({ t: ticketId, a: answer, e: lc(email), s: answerSig(ticketId, answer, email) });
+  return `${base.replace(/\/$/, "")}/api/answer?${q}`;
+}
+
+function ticketUrlFor(appUrl, t) {
+  return `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(t.shortId || t._id || "")}${t.shareToken ? "/" + t.shareToken : ""}`;
+}
+
+const PRI_CHIP = {
+  emergency: 'background:#fee2e2;color:#991b1b',
+  urgent: 'background:#ffedd5;color:#9a3412',
+  normal: 'background:#f3f4f6;color:#4b5563',
+};
+function priChip(p) {
+  const k = lc(p) || "normal";
+  return `<span style="display:inline-block;${PRI_CHIP[k] || PRI_CHIP.normal};font-size:11px;font-weight:700;border-radius:999px;padding:2px 9px;text-transform:uppercase;letter-spacing:.04em">${esc(PRIORITY_LABEL[k] || k)}</span>`;
+}
+
+/** Everyone FixMi already emails — the guard on "send a test to this address". */
+function knownAddresses(master, prefs) {
+  const known = new Set([...(prefs.testTo || []), ...(prefs.alwaysTo || [])]);
+  [master.admins, master.directors, master.areaCoaches, master.repairTechnicians, master.restaurants]
+    .forEach(g => Object.values(g || {}).forEach(o => { const e = lc(o && o.email); if (e) known.add(e); }));
+  return known;
+}
+
+/** Post a batch to Postmark and read the per-message results properly. */
+async function sendBatch(cfg, messages) {
+  const out = { ok: false, sent: 0, failed: [] };
+  for (let i = 0; i < messages.length; i += 500) {          // Postmark caps a batch at 500
+    const slice = messages.slice(i, i + 500);
+    const pm = await fetch("https://api.postmarkapp.com/email/batch", {
+      method: "POST",
+      headers: { "Accept": "application/json", "Content-Type": "application/json", "X-Postmark-Server-Token": cfg.token },
+      body: JSON.stringify(slice),
+    });
+    const results = await pm.json().catch(() => []);
+    const list = Array.isArray(results) ? results : [results];
+    if (!pm.ok) { out.failed.push({ status: pm.status, detail: list }); continue; }
+    list.forEach((x, j) => {
+      if (x && x.ErrorCode) out.failed.push({ to: (slice[j] || {}).To, code: x.ErrorCode, message: x.Message });
+      else out.sent++;
+    });
+  }
+  out.ok = out.sent > 0 && !out.failed.length;
+  return out;
+}
+
+function testBanner(person, html) {
+  return html.replace(/(<tr><td style="background:#1d76bb[^]*?<\/td><\/tr>)/,
+    `$1<tr><td style="background:#fffbeb;border-bottom:1px solid #fde68a;padding:11px 24px;font-size:12.5px;color:#92400e">` +
+    `<b>Test mode.</b> Live, this would have gone to ${esc(person.name)} &lt;${esc(person.email)}&gt;.</td></tr>`);
+}
+
+function shell(title, subtitle, inner) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f4f6"><tr><td align="center" style="padding:24px 12px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#fff;border-radius:12px;overflow:hidden">
+  <tr><td style="background:#1d76bb;padding:14px 24px;color:#fff;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">FixMi &nbsp;·&nbsp; Weekly summary</td></tr>
+  <tr><td style="padding:22px 24px 4px"><div style="font-size:20px;font-weight:700;line-height:1.3">${esc(title)}</div>
+    <div style="font-size:14px;color:#6b7280;margin-top:5px">${esc(subtitle)}</div></td></tr>
+  ${inner}
+  <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af;line-height:1.5">
+    Dossani Paradise · Repair &amp; Maintenance · sent every week from FixMi</td></tr>
+</table></td></tr></table></body></html>`;
+}
+
+/** The General Manager's store, in full, with a question against each ticket. */
+function summaryGM(master, person, cfg) {
+  const store = person.store || {};
+  const tickets = openTicketsFor(master, person.storeId);
+  const label = storeLabel(store);
+  if (!tickets.length) {
+    return {
+      subject: `FixMi weekly — ${label}: nothing open`,
+      html: shell(`Nothing open at ${label}`, "No maintenance tickets are outstanding this week. Nothing for you to do.",
+        `<tr><td style="padding:14px 24px 24px"><div style="font-size:15px;line-height:1.55;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">All clear. If something breaks, open a ticket in FixMi and it will appear here next week.</div></td></tr>`),
+      text: `Nothing open at ${label}.\n\nNo maintenance tickets are outstanding this week.`,
+    };
+  }
+  const rows = tickets.map(t => {
+    const yes = answerUrl(cfg.selfUrl, t._id, "yes", person.email);
+    const no = answerUrl(cfg.selfUrl, t._id, "no", person.email);
+    const cat = t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ");
+    return `<tr><td style="padding:0 24px 12px">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-radius:10px">
+        <tr><td style="padding:14px 16px">
+          <div style="font-size:12px;color:#6b7280">${priChip(t.priority)} &nbsp; <b style="color:#111827">${esc(t.shortId || "")}</b> · ${esc(STATUS_LABEL[t.status] || t.status)} · open ${esc(ageOf(t.createdAt))}</div>
+          ${cat ? `<div style="font-size:13px;color:#6b7280;margin-top:5px">${esc(cat)}</div>` : ""}
+          <div style="font-size:15px;line-height:1.5;margin-top:6px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
+          <div style="font-size:12.5px;color:#6b7280;margin-top:7px">Opened ${esc(fmtDay(t.createdAt))} by ${esc(t.createdByName || t.createdBy || "someone")}${t.assigneeLabel ? ` · assigned to ${esc(t.assigneeLabel)}` : ""}</div>
+          <div style="margin-top:13px;font-size:13.5px;font-weight:700">Is this still a problem?</div>
+          <div style="margin-top:8px">
+            <a href="${esc(yes)}" style="display:inline-block;background:#e8091b;color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:9px 22px;border-radius:8px;margin-right:8px">Yes — still open</a>
+            <a href="${esc(no)}" style="display:inline-block;background:#059669;color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:9px 22px;border-radius:8px">No — it's fixed</a>
+          </div>
+          <div style="margin-top:9px;font-size:12px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" style="color:#1d76bb">Open it in FixMi</a></div>
+        </td></tr>
+      </table></td></tr>`;
+  }).join("");
+  const text = [
+    `${label} — ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`, "",
+    ...tickets.map(t => [
+      `${t.shortId} · ${PRIORITY_LABEL[lc(t.priority)] || "Normal"} · ${STATUS_LABEL[t.status] || t.status} · open ${ageOf(t.createdAt)}`,
+      t.description || "No description",
+      `Still a problem?  YES: ${answerUrl(cfg.selfUrl, t._id, "yes", person.email)}`,
+      `                  NO:  ${answerUrl(cfg.selfUrl, t._id, "no", person.email)}`,
+      "",
+    ].join("\n")),
+  ].join("\n");
+  return {
+    subject: `FixMi weekly — ${label}: ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`,
+    html: shell(`${tickets.length} open at ${label}`,
+      "Please answer Yes or No on each one. One click — your answer is written straight onto the ticket.",
+      `<tr><td style="height:10px"></td></tr>${rows}`),
+    text,
+  };
+}
+
+/** The District Manager's patch: every store, subject lines only. */
+function summaryDM(master, person) {
+  const blocks = person.storeIds.map(sid => {
+    const store = (master.restaurants || {})[sid] || {};
+    const tickets = openTicketsFor(master, sid);
+    return { label: storeLabel(store), tickets };
+  }).sort((a, b) => b.tickets.length - a.tickets.length || a.label.localeCompare(b.label));
+  const total = blocks.reduce((n, b) => n + b.tickets.length, 0);
+  const rows = blocks.map(b => `<tr><td style="padding:0 24px 14px">
+      <div style="font-size:14px;font-weight:700;border-bottom:1px solid #e5e7eb;padding-bottom:5px">${esc(b.label)}
+        <span style="float:right;color:#6b7280;font-weight:400">${b.tickets.length} open</span></div>
+      ${b.tickets.length
+        ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13.5px;line-height:1.5;margin-top:7px">${
+            b.tickets.map(t => `<tr>
+              <td style="padding:3px 8px 3px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
+              <td style="padding:3px 0;vertical-align:top"><b>${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
+                <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></td></tr>`).join("")
+          }</table>`
+        : `<div style="font-size:13.5px;color:#059669;margin-top:6px">Nothing open.</div>`}
+    </td></tr>`).join("");
+  const text = [`${total} open across ${blocks.length} store${blocks.length === 1 ? "" : "s"}`, "",
+    ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n` +
+      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})`).join("\n") : "  Nothing open.") + "\n")].join("\n");
+  return {
+    subject: `FixMi weekly — ${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
+    html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
+      "Every open ticket on your patch, busiest store first.", `<tr><td style="height:10px"></td></tr>${rows}`),
+    text,
+  };
+}
+
+/** The Director's league table: counts only, worst first. */
+function summaryDO(master, person) {
+  const rowsData = person.storeIds.map(sid => {
+    const store = (master.restaurants || {})[sid] || {};
+    const tickets = openTicketsFor(master, sid);
+    return {
+      label: storeLabel(store), n: tickets.length,
+      urgent: tickets.filter(t => ["emergency", "urgent"].includes(lc(t.priority))).length,
+      oldest: tickets.length ? Math.min(...tickets.map(t => t.createdAt || Date.now())) : 0,
+    };
+  }).sort((a, b) => b.n - a.n || a.label.localeCompare(b.label));
+  const total = rowsData.reduce((n, r) => n + r.n, 0);
+  const worst = Math.max(1, ...rowsData.map(r => r.n));
+  const rows = rowsData.map(r => `<tr>
+      <td style="padding:7px 10px 7px 0;font-size:14px;border-bottom:1px solid #f3f4f6">${esc(r.label)}</td>
+      <td style="padding:7px 10px;width:45%;border-bottom:1px solid #f3f4f6">
+        <div style="background:#f3f4f6;border-radius:999px;height:8px"><div style="background:${r.urgent ? "#e8091b" : "#1d76bb"};width:${Math.round((r.n / worst) * 100)}%;height:8px;border-radius:999px"></div></div></td>
+      <td style="padding:7px 0;text-align:right;font-size:14px;font-weight:700;white-space:nowrap;border-bottom:1px solid #f3f4f6">${r.n}${r.urgent ? `<span style="color:#e8091b;font-weight:400;font-size:12px"> · ${r.urgent} urgent+</span>` : ""}</td>
+    </tr>`).join("");
+  const text = [`${total} open across ${rowsData.length} stores`, "",
+    ...rowsData.map(r => `${String(r.n).padStart(3)}  ${r.label}${r.urgent ? `  (${r.urgent} urgent or emergency)` : ""}`)].join("\n");
+  return {
+    subject: `FixMi weekly — ${total} open across ${rowsData.length} stores`,
+    html: shell(`${total} open across ${rowsData.length} stores`,
+      "Open ticket count per store, most to least.",
+      `<tr><td style="padding:14px 24px 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${rows}</table></td></tr>`),
+    text,
+  };
+}
+
+/* Everyone who should get a summary, and what each of them should see. Roles
+   come from FindMi at send time, so a new GM is included the week they start. */
+function summaryAudience(master, kind) {
+  const stores = master.restaurants || {};
+  const out = [];
+  if (kind === "gm") {
+    Object.entries(stores).forEach(([sid, st]) => {
+      if (lc(st.email).includes("@")) out.push({ kind, email: lc(st.email), name: st.storeManager || storeLabel(st), storeId: sid, store: st });
+    });
+  } else if (kind === "dm") {
+    Object.entries(master.areaCoaches || {}).forEach(([id, c]) => {
+      if (!lc(c.email).includes("@")) return;
+      const storeIds = Object.keys(stores).filter(sid => storeCoachIds(stores[sid]).includes(id));
+      if (storeIds.length) out.push({ kind, email: lc(c.email), name: c.name || c.email, storeIds });
+    });
+  } else if (kind === "do") {
+    Object.entries(master.directors || {}).forEach(([id, d]) => {
+      if (!lc(d.email).includes("@")) return;
+      const storeIds = Object.keys(stores).filter(sid => stores[sid].assignedDirectorId === id);
+      if (storeIds.length) out.push({ kind, email: lc(d.email), name: d.name || d.email, storeIds });
+    });
+  }
+  return out;
+}
+
+function buildSummary(master, person, cfg) {
+  if (person.kind === "gm") return summaryGM(master, person, cfg);
+  if (person.kind === "dm") return summaryDM(master, person);
+  return summaryDO(master, person);
+}
+
+/* A stand-in used by the "send me a test" buttons, so a summary can be seen
+   even by someone who isn't a GM anywhere. Picks the busiest real store /
+   patch, so the test looks like the real thing rather than an empty shell. */
+function sampleAudience(master, kind, email) {
+  const real = summaryAudience(master, kind);
+  const mine = real.find(p => p.email === lc(email));
+  if (mine) return { ...mine, email: lc(email) };
+  const busiest = real.map(p => ({
+    p, n: (p.kind === "gm" ? [p.storeId] : p.storeIds).reduce((n, sid) => n + openTicketsFor(master, sid).length, 0),
+  })).sort((a, b) => b.n - a.n)[0];
+  if (busiest) return { ...busiest.p, email: lc(email), sample: true };
+  return null;
+}
+
 module.exports = async (req, res) => {
   const allow = process.env.FIXMI_ALLOW_ORIGIN || "*";
   res.setHeader("Access-Control-Allow-Origin", allow);
@@ -278,7 +582,7 @@ module.exports = async (req, res) => {
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
     if (secret !== want) return res.status(401).json({ error: "bad secret" });
-    const DIAG = ["selftest", "sendtest", "postmark"];
+    const DIAG = ["selftest", "sendtest", "postmark", "summary"];
     if (!EVENTS.includes(event) && !DIAG.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
     if (!ticketId && !DIAG.includes(event)) return res.status(400).json({ error: "ticketId is required" });
 
@@ -315,9 +619,35 @@ module.exports = async (req, res) => {
        Settings → Email — so this can't be turned into a way to mail strangers. */
     if (event === "selftest") {
       const prefs0 = prefsFrom(master);
+      /* Probe the other two endpoints from here rather than from the browser:
+         no CORS to arrange, and it proves they answer on the public URL that
+         Postmark and the buttons in an email will actually use. */
+      const self = (process.env.FIXMI_SELF_URL || `https://${req.headers.host || ""}`).replace(/\/$/, "");
+      const probe = async (path) => {
+        try {
+          const c = new AbortController(); const t = setTimeout(() => c.abort(), 6000);
+          const r2 = await fetch(`${self}${path}`, { signal: c.signal });
+          clearTimeout(t);
+          return { status: r2.status };
+        } catch (e) { return { status: 0, error: (e && e.message) || String(e) }; }
+      };
+      const [answerProbe, weeklyProbe] = await Promise.all([probe("/api/answer"), probe("/api/weekly")]);
+      const wk = ((master.admins || {}).notifyPrefs || {}).weekly || {};
+
       const out = {
         ok: true,
         tokenPresent: !!cfg.token,
+        selfUrl: self,
+        selfUrlSet: !!process.env.FIXMI_SELF_URL,
+        endpoints: { answer: answerProbe, weekly: weeklyProbe },
+        weekly: {
+          on: !!wk.on,
+          day: wk.day || "monday",
+          kinds: Array.isArray(wk.kinds) && wk.kinds.length ? wk.kinds : ["gm", "dm", "do"],
+          lastSentYmd: wk.lastSentYmd || "",
+          lastSentAt: wk.lastSentAt || 0,
+        },
+        writePassPresent: !!process.env.FIXMI_WRITE_PASSWORD,
         dryRun: cfg.dryRun,
         notifyOff: process.env.FIXMI_NOTIFY_OFF === "1",
         from: cfg.from,
@@ -393,11 +723,67 @@ module.exports = async (req, res) => {
       });
     }
 
+    /* ---- WEEKLY SUMMARIES --------------------------------------------------
+       mode "preview" builds one and hands back the HTML without sending.
+       mode "test" sends one to addresses FixMi already knows.
+       mode "run"  sends the real thing to everyone, honouring test mode. */
+    if (event === "summary") {
+      const prefs0 = prefsFrom(master);
+      const mode = body.mode || "preview";
+      const kind = ["gm", "dm", "do"].includes(body.kind) ? body.kind : "gm";
+      const sCfg = {
+        appUrl: cfg.appUrl,
+        selfUrl: (process.env.FIXMI_SELF_URL || `https://${req.headers.host || ""}`).replace(/\/$/, ""),
+      };
+
+      if (mode === "preview" || mode === "test") {
+        const who = sampleAudience(master, kind, body.to || (arr(body.to)[0]) || "preview@example.com");
+        if (!who) return res.status(200).json({ ok: false, reason: `there are no ${kind.toUpperCase()}s with an email address in FindMi yet` });
+        const built = buildSummary(master, who, sCfg);
+        if (mode === "preview") return res.status(200).json({ ok: true, kind, sample: !!who.sample, forName: who.name, ...built });
+
+        const known = knownAddresses(master, prefs0);
+        const to = [...new Set(arr(body.to).map(lc).filter(e => e.includes("@")))].filter(e => known.has(e));
+        if (!to.length) return res.status(400).json({ error: "the test address has to be someone FixMi already knows, or a test address from Settings → Email" });
+        if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+        const r2 = await sendBatch(cfg, to.map(e => ({
+          From: `FixMi <${cfg.from}>`, To: e,
+          Subject: built.subject, HtmlBody: built.html, TextBody: built.text,
+          MessageStream: cfg.stream, Tag: `summary-${kind}`, TrackOpens: false, TrackLinks: "None",
+        })));
+        return res.status(200).json({ ok: r2.ok, kind, to, sample: !!who.sample, forName: who.name, subject: built.subject, detail: r2.failed });
+      }
+
+      // mode "run" — the real weekly send
+      if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+      const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => ["gm", "dm", "do"].includes(k)) : ["gm", "dm", "do"];
+      const messages = [], log = [];
+      kinds.forEach(k => {
+        summaryAudience(master, k).forEach(person => {
+          const built = buildSummary(master, person, sCfg);
+          // Test mode: everything goes to the test addresses instead, and says
+          // whose summary it is so a pile of them is still readable.
+          const targets = prefs0.testMode ? prefs0.testTo : [person.email];
+          targets.forEach(addr => messages.push({
+            From: `FixMi <${cfg.from}>`, To: addr,
+            Subject: prefs0.testMode ? `${built.subject}  →  ${person.name}` : built.subject,
+            HtmlBody: prefs0.testMode ? testBanner(person, built.html) : built.html,
+            TextBody: (prefs0.testMode ? `TEST MODE — live, this would have gone to ${person.name} <${person.email}>.\n\n` : "") + built.text,
+            MessageStream: cfg.stream, Tag: `summary-${k}`, TrackOpens: false, TrackLinks: "None",
+          }));
+          log.push(`${k}:${person.email}`);
+        });
+      });
+      if (!messages.length) return res.status(200).json({ ok: true, sent: 0, reason: "nobody to send to — no store, DM or Director in FindMi has an email address" });
+      if (prefs0.testMode && !prefs0.testTo.length) return res.status(200).json({ ok: false, sent: 0, reason: "test mode is on but no test addresses are set" });
+      const r3 = await sendBatch(cfg, messages);
+      console.log("[fixmi-notify] weekly summaries", { testMode: prefs0.testMode, built: log.length, sent: r3.sent });
+      return res.status(200).json({ ok: r3.ok, sent: r3.sent, testMode: prefs0.testMode, people: log, failed: r3.failed });
+    }
+
     if (event === "sendtest") {
       const prefs0 = prefsFrom(master);
-      const known = new Set([...prefs0.testTo, ...prefs0.alwaysTo]);
-      [master.admins, master.directors, master.areaCoaches, master.repairTechnicians, master.restaurants]
-        .forEach(g => Object.values(g || {}).forEach(o => { const e = lc(o && o.email); if (e) known.add(e); }));
+      const known = knownAddresses(master, prefs0);
       const to = [...new Set(arr(body.to).map(lc).filter(e => e.includes("@")))].filter(e => known.has(e));
       if (!to.length) return res.status(400).json({ error: "the test address has to be someone FixMi already knows, or a test address from Settings → Email" });
       if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
@@ -448,8 +834,11 @@ module.exports = async (req, res) => {
       : null;
     if (!people.length) return res.status(200).json({
       sent: 0,
-      reason: prefs.testMode ? "test mode is on but no test addresses are set"
-                             : "nobody is set to receive this event — check Settings → Email, and that these people have emails in FindMi",
+      reason: !prefs.testMode
+        ? "nobody is set to receive this event — check Settings → Email, and that these people have emails in FindMi"
+        : (wouldHaveGoneTo && wouldHaveGoneTo.length)
+          ? "test mode is on but no test addresses are set"
+          : `nobody would receive this even with test mode off — the boxes for this event, or for ${PRIORITY_LABEL[lc(ticket.priority) || "normal"] || "this"} priority, are unticked`,
     });
 
     const { html, text, url } = bodyFor({ event, store, ticket, prevStatus, appUrl: cfg.appUrl, actorName, comment, wouldHaveGoneTo, extra: { assigneeChanged, assignee }, thread, canReply: !!cfg.replyDomain });
