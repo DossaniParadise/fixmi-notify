@@ -72,6 +72,10 @@ const PREF_DEFAULTS = {
   /* Which priorities each role/event pair actually wants. Absent means all
      three, so every record saved before this existed keeps behaving the same. */
   pri: {},
+  /* One named person's own settings, which beat their role's. Keyed by email.
+     Only the parts actually set are honoured, so someone can be given their own
+     answer on comments while still following their role for everything else. */
+  people: {},
 };
 const PRIORITIES = ["emergency", "urgent", "normal"];
 /** Read Settings → Email out of the master, falling back to sane defaults. */
@@ -98,6 +102,25 @@ function prefsFrom(master) {
         });
       });
     }
+    if (raw.people && typeof raw.people === "object") {
+      Object.entries(raw.people).forEach(([em, v]) => {
+        const e = lc(em); if (!e.includes("@") || !v || typeof v !== "object") return;
+        const rec = {};
+        if (v.roles && typeof v.roles === "object") {
+          rec.roles = {};
+          EVENTS.forEach(ev => { if (typeof v.roles[ev] === "boolean") rec.roles[ev] = v.roles[ev]; });
+        }
+        if (v.pri && typeof v.pri === "object") {
+          rec.pri = {};
+          EVENTS.forEach(ev => {
+            const list = v.pri[ev];
+            if (Array.isArray(list)) rec.pri[ev] = list.map(lc).filter(x => PRIORITIES.includes(x));
+          });
+        }
+        if (typeof v.weekly === "boolean") rec.weekly = v.weekly;
+        if (Object.keys(rec).length) p.people[e] = rec;
+      });
+    }
     ["testTo", "alwaysTo"].forEach(k => {
       const v = raw[k];
       p[k] = (Array.isArray(v) ? v : String(v || "").split(/[,;\s]+/)).map(lc).filter(e => e.includes("@"));
@@ -115,13 +138,22 @@ function recipientsFor(master, ticket, opts) {
      "all of them" — so nobody silently stops getting email because a record
      predates this setting. */
   const pri = lc(ticket.priority) || "normal";
-  const priOk = key => {
-    const list = ((prefs.pri || {})[key] || {})[event];
+  /* A person's own setting wins over their role's, in both directions: it can
+     switch them off when the role is on, and on when the role is off. Anything
+     they have no answer for falls back to the role. */
+  const wants = (key, email) => {
+    const ov = (prefs.people || {})[lc(email)] || null;
+    const evOn = (ov && ov.roles && typeof ov.roles[event] === "boolean")
+      ? ov.roles[event]
+      : (prefs.roles[key] || {})[event];
+    if (!evOn) return false;
+    const list = (ov && ov.pri && Array.isArray(ov.pri[event]))
+      ? ov.pri[event]
+      : ((prefs.pri || {})[key] || {})[event];
     return !Array.isArray(list) || list.includes(pri);
   };
   const put = (email, name, role, key) => {
-    if (key && !(prefs.roles[key] || {})[event]) return;   // this role is switched off for this event
-    if (key && !priOk(key)) return;                        // ...or off for this priority
+    if (key && !wants(key, email)) return;                 // off for this event, priority, or person
     const e = lc(email);
     if (e && e.includes("@") && !out.has(e)) out.set(e, { email: e, name: name || e, role });
   };
@@ -348,6 +380,11 @@ function answerUrl(base, ticketId, answer, email) {
 function ticketUrlFor(appUrl, t) {
   return `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(t.shortId || t._id || "")}${t.shareToken ? "/" + t.shareToken : ""}`;
 }
+/* One store, all of its tickets. Staff only — there is no share token on this
+   one, so FixMi asks whoever follows it to sign in first. */
+function storeUrlFor(appUrl, storeId) {
+  return `${appUrl.replace(/#.*$/, "")}#s/${encodeURIComponent(storeId)}`;
+}
 
 const PRI_CHIP = {
   emergency: 'background:#fee2e2;color:#991b1b',
@@ -462,43 +499,51 @@ function summaryGM(master, person, cfg) {
 }
 
 /** The District Manager's patch: every store, subject lines only. */
-function summaryDM(master, person) {
+function summaryDM(master, person, cfg) {
+  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
   const blocks = person.storeIds.map(sid => {
     const store = (master.restaurants || {})[sid] || {};
     const tickets = openTicketsFor(master, sid);
-    return { label: storeLabel(store), tickets };
+    return { sid, label: storeLabel(store), tickets };
   }).sort((a, b) => b.tickets.length - a.tickets.length || a.label.localeCompare(b.label));
   const total = blocks.reduce((n, b) => n + b.tickets.length, 0);
+  /* Everything here is a link: the store name opens that store's whole list,
+     each line opens the ticket itself. Underlines are left off so it still
+     reads as a list rather than a wall of blue. */
   const rows = blocks.map(b => `<tr><td style="padding:0 24px 14px">
-      <div style="font-size:14px;font-weight:700;border-bottom:1px solid #e5e7eb;padding-bottom:5px">${esc(b.label)}
+      <div style="font-size:14px;font-weight:700;border-bottom:1px solid #e5e7eb;padding-bottom:5px">
+        <a href="${esc(storeUrlFor(app, b.sid))}" style="color:#111827;text-decoration:none">${esc(b.label)} <span style="color:#1d76bb;font-size:12px;font-weight:400">view store &rsaquo;</span></a>
         <span style="float:right;color:#6b7280;font-weight:400">${b.tickets.length} open</span></div>
       ${b.tickets.length
         ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13.5px;line-height:1.5;margin-top:7px">${
             b.tickets.map(t => `<tr>
-              <td style="padding:3px 8px 3px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
-              <td style="padding:3px 0;vertical-align:top"><b>${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
-                <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></td></tr>`).join("")
+              <td style="padding:4px 8px 4px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
+              <td style="padding:4px 0;vertical-align:top"><a href="${esc(ticketUrlFor(app, t))}" style="color:#111827;text-decoration:none">
+                <b style="color:#1d76bb">${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
+                <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a></td></tr>`).join("")
           }</table>`
         : `<div style="font-size:13.5px;color:#059669;margin-top:6px">Nothing open.</div>`}
     </td></tr>`).join("");
   const text = [`${total} open across ${blocks.length} store${blocks.length === 1 ? "" : "s"}`, "",
-    ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n` +
-      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})`).join("\n") : "  Nothing open.") + "\n")].join("\n");
+    ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n${storeUrlFor(app, b.sid)}\n` +
+      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${ticketUrlFor(app, t)}`).join("\n") : "  Nothing open.") + "\n")].join("\n");
   return {
     subject: `FixMi weekly — ${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
     html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
-      "Every open ticket on your patch, busiest store first.", `<tr><td style="height:10px"></td></tr>${rows}`),
+      "Every open ticket on your patch, busiest store first. Tap a store to see all of its tickets, or a line to open that one.",
+      `<tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
 }
 
 /** The Director's league table: counts only, worst first. */
-function summaryDO(master, person) {
+function summaryDO(master, person, cfg) {
+  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
   const rowsData = person.storeIds.map(sid => {
     const store = (master.restaurants || {})[sid] || {};
     const tickets = openTicketsFor(master, sid);
     return {
-      label: storeLabel(store), n: tickets.length,
+      sid, label: storeLabel(store), n: tickets.length,
       urgent: tickets.filter(t => ["emergency", "urgent"].includes(lc(t.priority))).length,
       oldest: tickets.length ? Math.min(...tickets.map(t => t.createdAt || Date.now())) : 0,
     };
@@ -506,7 +551,7 @@ function summaryDO(master, person) {
   const total = rowsData.reduce((n, r) => n + r.n, 0);
   const worst = Math.max(1, ...rowsData.map(r => r.n));
   const rows = rowsData.map(r => `<tr>
-      <td style="padding:7px 10px 7px 0;font-size:14px;border-bottom:1px solid #f3f4f6">${esc(r.label)}</td>
+      <td style="padding:7px 10px 7px 0;font-size:14px;border-bottom:1px solid #f3f4f6"><a href="${esc(storeUrlFor(app, r.sid))}" style="color:#111827;text-decoration:none">${esc(r.label)}</a></td>
       <td style="padding:7px 10px;width:45%;border-bottom:1px solid #f3f4f6">
         <div style="background:#f3f4f6;border-radius:999px;height:8px"><div style="background:${r.urgent ? "#e8091b" : "#1d76bb"};width:${Math.round((r.n / worst) * 100)}%;height:8px;border-radius:999px"></div></div></td>
       <td style="padding:7px 0;text-align:right;font-size:14px;font-weight:700;white-space:nowrap;border-bottom:1px solid #f3f4f6">${r.n}${r.urgent ? `<span style="color:#e8091b;font-weight:400;font-size:12px"> · ${r.urgent} urgent+</span>` : ""}</td>
@@ -516,7 +561,7 @@ function summaryDO(master, person) {
   return {
     subject: `FixMi weekly — ${total} open across ${rowsData.length} stores`,
     html: shell(`${total} open across ${rowsData.length} stores`,
-      "Open ticket count per store, most to least.",
+      "Open ticket count per store, most to least. Tap a store to see its tickets.",
       `<tr><td style="padding:14px 24px 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${rows}</table></td></tr>`),
     text,
   };
@@ -524,22 +569,24 @@ function summaryDO(master, person) {
 
 /* Everyone who should get a summary, and what each of them should see. Roles
    come from FindMi at send time, so a new GM is included the week they start. */
-function summaryAudience(master, kind) {
+function summaryAudience(master, kind, prefs) {
   const stores = master.restaurants || {};
+  const people = (prefs && prefs.people) || {};
+  const optedOut = e => ((people[lc(e)] || {}).weekly === false);
   const out = [];
   if (kind === "gm") {
     Object.entries(stores).forEach(([sid, st]) => {
-      if (lc(st.email).includes("@")) out.push({ kind, email: lc(st.email), name: st.storeManager || storeLabel(st), storeId: sid, store: st });
+      if (lc(st.email).includes("@") && !optedOut(st.email)) out.push({ kind, email: lc(st.email), name: st.storeManager || storeLabel(st), storeId: sid, store: st });
     });
   } else if (kind === "dm") {
     Object.entries(master.areaCoaches || {}).forEach(([id, c]) => {
-      if (!lc(c.email).includes("@")) return;
+      if (!lc(c.email).includes("@") || optedOut(c.email)) return;
       const storeIds = Object.keys(stores).filter(sid => storeCoachIds(stores[sid]).includes(id));
       if (storeIds.length) out.push({ kind, email: lc(c.email), name: c.name || c.email, storeIds });
     });
   } else if (kind === "do") {
     Object.entries(master.directors || {}).forEach(([id, d]) => {
-      if (!lc(d.email).includes("@")) return;
+      if (!lc(d.email).includes("@") || optedOut(d.email)) return;
       const storeIds = Object.keys(stores).filter(sid => stores[sid].assignedDirectorId === id);
       if (storeIds.length) out.push({ kind, email: lc(d.email), name: d.name || d.email, storeIds });
     });
@@ -549,15 +596,15 @@ function summaryAudience(master, kind) {
 
 function buildSummary(master, person, cfg) {
   if (person.kind === "gm") return summaryGM(master, person, cfg);
-  if (person.kind === "dm") return summaryDM(master, person);
-  return summaryDO(master, person);
+  if (person.kind === "dm") return summaryDM(master, person, cfg);
+  return summaryDO(master, person, cfg);
 }
 
 /* A stand-in used by the "send me a test" buttons, so a summary can be seen
    even by someone who isn't a GM anywhere. Picks the busiest real store /
    patch, so the test looks like the real thing rather than an empty shell. */
-function sampleAudience(master, kind, email) {
-  const real = summaryAudience(master, kind);
+function sampleAudience(master, kind, email, prefs) {
+  const real = summaryAudience(master, kind, prefs);
   const mine = real.find(p => p.email === lc(email));
   if (mine) return { ...mine, email: lc(email) };
   const busiest = real.map(p => ({
@@ -658,6 +705,7 @@ module.exports = async (req, res) => {
         ticketsSeen: Object.keys(master.maintenanceTickets || {}).length,
         prefsFound: !!(master.admins || {}).notifyPrefs,
         prefs: { on: prefs0.on, testMode: prefs0.testMode, testTo: prefs0.testTo, alwaysTo: prefs0.alwaysTo, roles: prefs0.roles },
+        overrides: Object.keys(prefs0.people || {}),
         reply: {
           enabled: !!cfg.replyDomain,
           domain: cfg.replyDomain || null,
@@ -737,7 +785,7 @@ module.exports = async (req, res) => {
       };
 
       if (mode === "preview" || mode === "test") {
-        const who = sampleAudience(master, kind, body.to || (arr(body.to)[0]) || "preview@example.com");
+        const who = sampleAudience(master, kind, body.to || (arr(body.to)[0]) || "preview@example.com", prefs0);
         if (!who) return res.status(200).json({ ok: false, reason: `there are no ${kind.toUpperCase()}s with an email address in FindMi yet` });
         const built = buildSummary(master, who, sCfg);
         if (mode === "preview") return res.status(200).json({ ok: true, kind, sample: !!who.sample, forName: who.name, ...built });
@@ -759,7 +807,7 @@ module.exports = async (req, res) => {
       const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => ["gm", "dm", "do"].includes(k)) : ["gm", "dm", "do"];
       const messages = [], log = [];
       kinds.forEach(k => {
-        summaryAudience(master, k).forEach(person => {
+        summaryAudience(master, k, prefs0).forEach(person => {
           const built = buildSummary(master, person, sCfg);
           // Test mode: everything goes to the test addresses instead, and says
           // whose summary it is so a pile of them is still readable.
