@@ -376,13 +376,30 @@ function openTicketsFor(master, storeId) {
    and clicked from a phone with no login. They are signed with the shared
    secret so the ticket id and the answer can't be edited into something else,
    and they carry who was asked, so the comment is attributed properly. */
-function answerSig(ticketId, answer, email) {
+function answerSig(ticketId, answer, email, when) {
   return require("crypto").createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
-    .update(`${ticketId}|${answer}|${lc(email)}`).digest("hex").slice(0, 32);
+    .update(`${ticketId}|${answer}|${lc(email)}|${when || ""}`).digest("hex").slice(0, 32);
 }
-function answerUrl(base, ticketId, answer, email) {
-  const q = new URLSearchParams({ t: ticketId, a: answer, e: lc(email), s: answerSig(ticketId, answer, email) });
+/* `when` is the day this summary went out. It is signed in so that each week's
+   buttons are their own links — otherwise a manager who answered last week
+   would be told "already noted" every week after. */
+function answerUrl(base, ticketId, answer, email, when) {
+  const q = new URLSearchParams({ t: ticketId, a: answer, e: lc(email), w: when || "", s: answerSig(ticketId, answer, email, when) });
   return `${base.replace(/\/$/, "")}/api/answer?${q}`;
+}
+function todayStamp() {
+  const f = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Chicago", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const g = t => (f.find(x => x.type === t) || {}).value || "";
+  return `${g("year")}-${g("month")}-${g("day")}`;
+}
+
+/** The pair of buttons that turn a summary line into a one-tap answer. */
+function answerButtons(cfg, ticketId, email, size) {
+  const w = cfg.stamp || todayStamp();
+  const pad = size === "sm" ? "7px 15px" : "9px 22px";
+  const fs = size === "sm" ? "13px" : "14px";
+  return `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "unresolved", email, w))}" style="display:inline-block;background:#c81e1e;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 8px 6px 0">Unresolved</a>` +
+    `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "resolved", email, w))}" style="display:inline-block;background:#047857;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 0 6px 0">Resolved</a>`;
 }
 
 function ticketUrlFor(appUrl, t) {
@@ -468,8 +485,6 @@ function summaryGM(master, person, cfg) {
     };
   }
   const rows = tickets.map(t => {
-    const yes = answerUrl(cfg.selfUrl, t._id, "yes", person.email);
-    const no = answerUrl(cfg.selfUrl, t._id, "no", person.email);
     const cat = t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ");
     return `<tr><td style="padding:0 24px 12px">
       <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-radius:10px">
@@ -479,10 +494,7 @@ function summaryGM(master, person, cfg) {
           <div style="font-size:15px;line-height:1.5;margin-top:6px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
           <div style="font-size:12.5px;color:#6b7280;margin-top:7px">Opened ${esc(fmtDay(t.createdAt))} by ${esc(t.createdByName || t.createdBy || "someone")}${t.assigneeLabel ? ` · assigned to ${esc(t.assigneeLabel)}` : ""}</div>
           <div style="margin-top:13px;font-size:13.5px;font-weight:700">Is this still a problem?</div>
-          <div style="margin-top:8px">
-            <a href="${esc(yes)}" style="display:inline-block;background:#e8091b;color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:9px 22px;border-radius:8px;margin-right:8px">Yes — still open</a>
-            <a href="${esc(no)}" style="display:inline-block;background:#059669;color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:9px 22px;border-radius:8px">No — it's fixed</a>
-          </div>
+          <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email)}</div>
           <div style="margin-top:9px;font-size:12px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" style="color:#1d76bb">Open it in FixMi</a></div>
         </td></tr>
       </table></td></tr>`;
@@ -492,15 +504,15 @@ function summaryGM(master, person, cfg) {
     ...tickets.map(t => [
       `${t.shortId} · ${PRIORITY_LABEL[lc(t.priority)] || "Normal"} · ${STATUS_LABEL[t.status] || t.status} · open ${ageOf(t.createdAt)}`,
       t.description || "No description",
-      `Still a problem?  YES: ${answerUrl(cfg.selfUrl, t._id, "yes", person.email)}`,
-      `                  NO:  ${answerUrl(cfg.selfUrl, t._id, "no", person.email)}`,
+      `Still a problem?  UNRESOLVED: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}`,
+      `                  RESOLVED:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp)}`,
       "",
     ].join("\n")),
   ].join("\n");
   return {
     subject: `FixMi weekly — ${label}: ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`,
     html: shell(`${tickets.length} open at ${label}`,
-      "Please answer Yes or No on each one. One click — your answer is written straight onto the ticket.",
+      "Mark each one Unresolved or Resolved. One tap — it is written straight onto the ticket, and Resolved moves it to Finished.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
@@ -525,20 +537,21 @@ function summaryDM(master, person, cfg) {
       ${b.tickets.length
         ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13.5px;line-height:1.5;margin-top:7px">${
             b.tickets.map(t => `<tr>
-              <td style="padding:4px 8px 4px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
-              <td style="padding:4px 0;vertical-align:top"><a href="${esc(ticketUrlFor(app, t))}" style="color:#111827;text-decoration:none">
+              <td style="padding:6px 8px 10px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
+              <td style="padding:6px 0 10px;vertical-align:top"><a href="${esc(ticketUrlFor(app, t))}" style="color:#111827;text-decoration:none">
                 <b style="color:#1d76bb">${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
-                <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a></td></tr>`).join("")
+                <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a>
+                <div style="margin-top:6px">${answerButtons(cfg, t._id, person.email, "sm")}</div></td></tr>`).join("")
           }</table>`
         : `<div style="font-size:13.5px;color:#059669;margin-top:6px">Nothing open.</div>`}
     </td></tr>`).join("");
   const text = [`${total} open across ${blocks.length} store${blocks.length === 1 ? "" : "s"}`, "",
     ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n${storeUrlFor(app, b.sid)}\n` +
-      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${ticketUrlFor(app, t)}`).join("\n") : "  Nothing open.") + "\n")].join("\n");
+      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp)}`).join("\n") : "  Nothing open.") + "\n")].join("\n");
   return {
     subject: `FixMi weekly — ${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
     html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
-      "Every open ticket on your patch, busiest store first. Tap a store to see all of its tickets, or a line to open that one.",
+      "Every open ticket on your patch, busiest store first. Tap a store to see all of its tickets, a line to open that one, or mark it Unresolved / Resolved from here.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
@@ -704,6 +717,12 @@ function summaryAudience(master, kind, prefs) {
       const storeIds = Object.keys(stores).filter(sid => storeCoachIds(stores[sid]).includes(id));
       if (storeIds.length) out.push({ kind, email: lc(c.email), name: c.name || c.email, storeIds });
     });
+  } else if (kind === "ow") {
+    // Overwatch sees the same company-wide picture the VPs get.
+    Object.values(master.admins || {}).forEach(a => {
+      if (a && lc(a.email).includes("@") && !optedOut(a.email))
+        out.push({ kind, email: lc(a.email), name: a.name || a.email, storeIds: Object.keys(stores) });
+    });
   } else if (kind === "vp") {
     ((prefs && prefs.vpTo) || []).forEach(e => {
       if (lc(e).includes("@") && !optedOut(e)) out.push({ kind, email: lc(e), name: e, storeIds: Object.keys(stores) });
@@ -719,7 +738,7 @@ function summaryAudience(master, kind, prefs) {
 }
 
 function buildSummary(master, person, cfg) {
-  if (person.kind === "vp") return summaryVP(master, person, cfg);
+  if (person.kind === "vp" || person.kind === "ow") return summaryVP(master, person, cfg);
   if (person.kind === "gm") return summaryGM(master, person, cfg);
   if (person.kind === "dm") return summaryDM(master, person, cfg);
   return summaryDO(master, person, cfg);
@@ -729,8 +748,8 @@ function buildSummary(master, person, cfg) {
    even by someone who isn't a GM anywhere. Picks the busiest real store /
    patch, so the test looks like the real thing rather than an empty shell. */
 function sampleAudience(master, kind, email, prefs) {
-  // The VP list is just addresses, so anyone can preview it as themselves.
-  if (kind === "vp") return { kind, email: lc(email), name: email, storeIds: Object.keys(master.restaurants || {}) };
+  // VP and Overwatch are company-wide, so anyone can preview them as themselves.
+  if (kind === "vp" || kind === "ow") return { kind, email: lc(email), name: email, storeIds: Object.keys(master.restaurants || {}) };
   const real = summaryAudience(master, kind, prefs);
   const mine = real.find(p => p.email === lc(email));
   if (mine) return { ...mine, email: lc(email) };
@@ -905,10 +924,11 @@ module.exports = async (req, res) => {
     if (event === "summary") {
       const prefs0 = prefsFrom(master);
       const mode = body.mode || "preview";
-      const kind = ["gm", "dm", "do", "vp"].includes(body.kind) ? body.kind : "gm";
+      const kind = ["gm", "dm", "do", "vp", "ow"].includes(body.kind) ? body.kind : "gm";
       const sCfg = {
         appUrl: cfg.appUrl,
         selfUrl: (process.env.FIXMI_SELF_URL || `https://${req.headers.host || ""}`).replace(/\/$/, ""),
+        stamp: todayStamp(),          // signed into every answer link, so each send is its own
       };
 
       if (mode === "preview" || mode === "test") {
@@ -931,9 +951,34 @@ module.exports = async (req, res) => {
         return res.status(200).json({ ok: r2.ok, kind, to, sample: !!who.sample, forName: who.name, subject: built.subject, detail: r2.failed });
       }
 
+      /* mode "one" — this person's own summary, right now, off-schedule. Their
+         weekly opt-out is ignored on purpose: somebody chose them by name and
+         pressed send, which is a more specific instruction than a standing
+         preference. Test mode still applies, so this can't surprise anyone. */
+      if (mode === "one") {
+        const to = lc(body.to);
+        const list = summaryAudience(master, kind, {});     // {} = ignore opt-outs
+        let who = list.find(p => p.email === to);
+        if (!who && (kind === "vp" || kind === "ow")) who = { kind, email: to, name: to, storeIds: Object.keys(master.restaurants || {}) };
+        if (!who) return res.status(200).json({ ok: false, reason: `${to || "that address"} isn't a ${kind.toUpperCase()} FixMi knows about` });
+        if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+        const built = buildSummary(master, who, sCfg);
+        const targets = prefs0.testMode ? prefs0.testTo : [who.email];
+        if (!targets.length) return res.status(200).json({ ok: false, reason: "test mode is on but no test addresses are set" });
+        const r1 = await sendBatch(cfg, targets.map(addr => ({
+          From: `FixMi <${cfg.from}>`, To: addr,
+          Subject: prefs0.testMode ? `${built.subject}  →  ${who.name}` : built.subject,
+          HtmlBody: prefs0.testMode ? testBanner(who, built.html) : built.html,
+          TextBody: (prefs0.testMode ? `TEST MODE — live, this would have gone to ${who.name} <${who.email}>.\n\n` : "") + built.text,
+          MessageStream: cfg.stream, Tag: `summary-${kind}`, TrackOpens: false, TrackLinks: "None",
+        })));
+        console.log("[fixmi-notify] one-off summary", kind, who.email, "→", targets.join(", "));
+        return res.status(200).json({ ok: r1.ok, kind, forName: who.name, forEmail: who.email, to: targets, testMode: prefs0.testMode, subject: built.subject, failed: r1.failed });
+      }
+
       // mode "run" — the real weekly send
       if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
-      const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => ["gm", "dm", "do", "vp"].includes(k)) : ["gm", "dm", "do", "vp"];
+      const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => ["gm", "dm", "do", "vp", "ow"].includes(k)) : ["gm", "dm", "do", "vp"];
       const messages = [], log = [];
       kinds.forEach(k => {
         summaryAudience(master, k, prefs0).forEach(person => {
