@@ -29,14 +29,36 @@ const arr = v => Array.isArray(v) ? v : (v && typeof v === "object" ? Object.val
 const esc = v => String(v == null ? "" : v).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
-const TEXT = {
-  yes: "This issue is still not resolved.",
-  no: "This issue has been resolved.",
+/* "unresolved" leaves the ticket exactly where it is and just says so on the
+   thread. "resolved" moves it to Finished — not Closed: closing is a decision
+   for whoever checks the work and writes the closing notes, and a manager
+   tapping a button in an email is telling us the problem has gone away, not
+   signing the job off. */
+const ANSWERS = {
+  unresolved: { text: ts => `This issue is still unresolved as of ${ts}.`, status: null,
+                title: "Thanks — marked as still unresolved",
+                line: id => `We've noted that ${id} is still a problem, and told everyone working on it.` },
+  resolved:   { text: ts => `This issue is resolved as of ${ts}.`, status: "finished",
+                title: "Thanks — marked as resolved",
+                line: id => `${id} has been moved to Finished and everyone working on it has been told. It stays open until someone closes it off in FixMi.` },
 };
+// Links sent before the wording changed still work.
+const LEGACY = { yes: "unresolved", no: "resolved" };
 
-function sign(ticketId, answer, email) {
+function stampNow() {
+  return new Date().toLocaleString("en-US", {
+    timeZone: "America/Chicago", weekday: "short", month: "short", day: "numeric",
+    year: "numeric", hour: "numeric", minute: "2-digit",
+  });
+}
+
+/* The week the summary went out is signed in too, so this week's link is a
+   different link from last week's. Without it, a manager who answered
+   "unresolved" last Monday would find the same answer refused as a duplicate
+   every week afterwards. */
+function sign(ticketId, answer, email, when) {
   return crypto.createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
-    .update(`${ticketId}|${answer}|${lc(email)}`).digest("hex").slice(0, 32);
+    .update(`${ticketId}|${answer}|${lc(email)}|${when || ""}`).digest("hex").slice(0, 32);
 }
 /** Compare in constant time, so the signature can't be guessed a byte at a time. */
 function sigOk(given, want) {
@@ -70,16 +92,17 @@ module.exports = async (req, res) => {
   try {
     const q = req.query || {};
     const ticketId = String(q.t || "").trim();
-    const answer = lc(q.a);
+    const answer = LEGACY[lc(q.a)] || lc(q.a);
     const email = lc(q.e);
+    const when = String(q.w || "").trim();          // the week this went out
     const secret = process.env.FIXMI_SHARED_SECRET || "";
     const writePass = process.env.FIXMI_WRITE_PASSWORD || "";
     const appUrl = process.env.FIXMI_APP_URL || DEFAULTS.appUrl;
 
     if (!secret) return html(500, { title: "Not set up yet", line: "FIXMI_SHARED_SECRET is missing on the server, so this link can't be checked.", tone: "bad" });
-    if (!ticketId || !["yes", "no"].includes(answer) || !email)
+    if (!ticketId || !ANSWERS[answer] || !email)
       return html(400, { title: "That link is incomplete", line: "Please open the ticket in FixMi and leave a comment there instead.", tone: "bad" });
-    if (!sigOk(q.s, sign(ticketId, answer, email)))
+    if (!sigOk(q.s, sign(ticketId, answer, email, when)) && !sigOk(q.s, sign(ticketId, lc(q.a), email, when)))
       return html(403, { title: "That link isn't valid", line: "It may have been altered or retyped. Open the ticket in FixMi and comment there instead.", tone: "bad" });
     if (!writePass)
       return html(500, { title: "Not set up yet", line: "FIXMI_WRITE_PASSWORD is missing on the server, so your answer can't be saved.", tone: "bad" });
@@ -92,7 +115,8 @@ module.exports = async (req, res) => {
     if (!ticket) return html(404, { title: "That ticket is gone", line: "It may have been closed and archived since the summary was sent.", tone: "warn" });
 
     const url = `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticketId)}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
-    const text = TEXT[answer];
+    const spec = ANSWERS[answer];
+    const text = spec.text(stampNow());
 
     /* Who is answering. The address was signed into the link, so this is the
        person the summary was addressed to, not whoever forwarded it. */
@@ -103,23 +127,38 @@ module.exports = async (req, res) => {
     });
 
     const comments = arr(ticket.comments).slice();
-    const already = comments.find(c => c && c.answerKey === `${ticketId}|${answer}|${email}`);
+    const key = `${ticketId}|${answer}|${email}|${when}`;
+    const already = comments.find(c => c && c.answerKey === key);
     if (already) {
       return html(200, {
-        title: answer === "yes" ? "Already noted — still open" : "Already noted — resolved",
+        title: `Already noted — ${answer}`,
         line: `Your answer was recorded on ${ticket.shortId || "this ticket"} and everyone on it has been told. Nothing more to do.`,
         link: url,
       });
     }
 
+    const prevStatus = ticket.status;
     comments.push({
       id: uid(), by, role, email, text,
       ts: Date.now(),
       viaEmail: true,
       answer,                                    // so the app can show it as an answer, not just a comment
-      answerKey: `${ticketId}|${answer}|${email}`,
+      answerKey: key,
     });
     const updated = { ...ticket, comments, updatedAt: Date.now() };
+
+    /* Resolved moves it to Finished, with a line on the ticket's own timeline
+       so the move has an author rather than appearing from nowhere. Already
+       finished or closed is left alone — nothing to move, and re-opening a
+       closed ticket from an email would be a nasty surprise. */
+    const moved = spec.status && prevStatus !== spec.status && prevStatus !== "closed";
+    if (moved) {
+      updated.status = spec.status;
+      updated.activity = [...arr(ticket.activity), {
+        ts: Date.now(), by, role, action: "status", toStatus: spec.status,
+        note: "Marked resolved from the weekly summary email",
+      }];
+    }
 
     const w = await fetch(masterUrl, {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -133,8 +172,12 @@ module.exports = async (req, res) => {
     // Everyone else on the ticket hears about it — never the person answering.
     try {
       const notify = require("./notify.js");
+      /* One email, not two. A move to Finished goes out as the status change it
+         is, carrying the comment with it; an "unresolved" answer is only a
+         comment, so that is what it goes out as. */
       await notify({ method: "POST", query: {}, headers: {}, body: {
-        secret, event: "comment", ticketId, ticket: updated,
+        secret, event: moved ? "status" : "comment", ticketId, ticket: updated,
+        prevStatus,
         comment: { by, text, ts: Date.now() },
         thread: comments.slice(-25).map(c => ({ by: c.by, role: c.role, email: c.email, text: c.text, ts: c.ts })),
         actorEmail: email, actorName: by, _master: master,
@@ -143,14 +186,8 @@ module.exports = async (req, res) => {
       console.error("[fixmi-answer] saved, but the notification failed", e && e.message);
     }
 
-    console.log("[fixmi-answer]", ticket.shortId || ticketId, answer, "from", email);
-    return html(200, {
-      title: answer === "yes" ? "Thanks — marked as still open" : "Thanks — marked as resolved",
-      line: answer === "yes"
-        ? `We've noted that ${ticket.shortId || "this ticket"} is still a problem, and told everyone working on it.`
-        : `We've noted that ${ticket.shortId || "this ticket"} is fixed, and told everyone working on it.`,
-      link: url,
-    });
+    console.log("[fixmi-answer]", ticket.shortId || ticketId, answer, "from", email, moved ? "→ finished" : "");
+    return html(200, { title: spec.title, line: spec.line(ticket.shortId || "this ticket"), link: url });
   } catch (e) {
     console.error("[fixmi-answer] crashed", e);
     return html(500, { title: "Something went wrong", line: "Please open the ticket in FixMi and leave a comment there instead.", tone: "bad" });
