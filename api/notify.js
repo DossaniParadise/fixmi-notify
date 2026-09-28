@@ -103,7 +103,13 @@ function prefsFrom(master) {
       });
     }
     if (raw.people && typeof raw.people === "object") {
-      Object.entries(raw.people).forEach(([em, v]) => {
+      /* Written as a list, because the database refuses a key with a dot in it
+         and every one of these is keyed by an email address. An older record
+         may still be a map, so both are read. */
+      const entries = Array.isArray(raw.people)
+        ? raw.people.filter(Boolean).map(v => [v && v.email, v])
+        : Object.entries(raw.people).map(([k, v]) => [(v && v.email) || k, v]);
+      entries.forEach(([em, v]) => {
         const e = lc(em); if (!e.includes("@") || !v || typeof v !== "object") return;
         const rec = {};
         if (v.roles && typeof v.roles === "object") {
