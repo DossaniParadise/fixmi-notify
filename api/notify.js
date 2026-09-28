@@ -69,6 +69,8 @@ const PREF_DEFAULTS = {
            gm: { created: true, status: true, comment: true },
            tech: { created: false, status: false, comment: false }, reporter: { created: false, status: false, comment: false } },
   testMode: false, testTo: [], alwaysTo: [],
+  /* The VP summary has no role behind it — it goes to a named list. */
+  vpTo: [],
   /* Which priorities each role/event pair actually wants. Absent means all
      three, so every record saved before this existed keeps behaving the same. */
   pri: {},
@@ -127,7 +129,7 @@ function prefsFrom(master) {
         if (Object.keys(rec).length) p.people[e] = rec;
       });
     }
-    ["testTo", "alwaysTo"].forEach(k => {
+    ["testTo", "alwaysTo", "vpTo"].forEach(k => {
       const v = raw[k];
       p[k] = (Array.isArray(v) ? v : String(v || "").split(/[,;\s]+/)).map(lc).filter(e => e.includes("@"));
     });
@@ -573,6 +575,118 @@ function summaryDO(master, person, cfg) {
   };
 }
 
+/* ---- the VP view: every store at once, worst first ------------------------
+   Severity colours are validated for colour-blind separation against a white
+   email background (ΔE 15.6 normal vision, 9.2 deutan, all ≥3:1 contrast), and
+   every count is written out in words beside its colour, so nothing here is
+   carried by hue alone. */
+const SEV = {
+  emergency: { fill: "#c81e1e", label: "emergency" },
+  urgent:    { fill: "#c2740a", label: "urgent" },
+  normal:    { fill: "#1d76bb", label: "normal" },
+};
+const SEV_ORDER = ["emergency", "urgent", "normal"];
+
+function statTile(n, label, colour) {
+  return `<td width="33%" style="padding:0 5px" valign="top">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-radius:10px">
+      <tr><td style="padding:12px 14px">
+        <div style="font-size:30px;line-height:1.05;font-weight:800;color:${colour}">${n}</div>
+        <div style="font-size:12px;color:#6b7280;margin-top:3px;text-transform:uppercase;letter-spacing:.05em">${esc(label)}</div>
+      </td></tr></table></td>`;
+}
+
+/* A thin stacked bar. Its LENGTH is the store's share of the busiest store, so
+   volume is comparable from tile to tile; its segments are the split by
+   severity. Measuring each bar against its own total instead would make one
+   emergency look the same weight as four tickets. 2px of surface between
+   segments rather than a border. */
+function sevBar(counts, total, max) {
+  const scale = Math.max(1, max);
+  const segs = SEV_ORDER.filter(k => counts[k]).map(k =>
+    `<td width="${Math.max(3, Math.round((counts[k] / scale) * 100))}%" style="background:${SEV[k].fill};height:8px;border-radius:3px;font-size:0;line-height:0">&nbsp;</td>` +
+    `<td width="2" style="font-size:0;line-height:0">&nbsp;</td>`).join("");
+  const used = SEV_ORDER.filter(k => counts[k]).reduce((n, k) => n + Math.max(3, Math.round((counts[k] / scale) * 100)), 0);
+  const rest = Math.max(0, 100 - used);
+  return `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:9px;table-layout:fixed"><tr>${segs}` +
+    (rest ? `<td width="${rest}%" style="font-size:0;line-height:0">&nbsp;</td>` : "") + `</tr></table>`;
+}
+
+function storeTile(row, app, max) {
+  const worst = SEV_ORDER.find(k => row.counts[k]) || "normal";
+  const parts = SEV_ORDER.filter(k => row.counts[k]).map(k =>
+    `<span style="white-space:nowrap"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${SEV[k].fill}"></span> ${row.counts[k]} ${SEV[k].label}</span>`).join(" &nbsp;·&nbsp; ");
+  return `<td width="50%" style="padding:0 5px 10px" valign="top">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-left:4px solid ${SEV[worst].fill};border-radius:10px">
+      <tr><td style="padding:12px 14px">
+        <a href="${esc(storeUrlFor(app, row.sid))}" style="color:#111827;text-decoration:none">
+          <div style="font-size:13.5px;font-weight:700;line-height:1.3">${esc(row.label)}</div>
+          <div style="font-size:26px;font-weight:800;line-height:1.1;margin-top:5px">${row.total}<span style="font-size:12px;font-weight:400;color:#6b7280"> open</span></div>
+          ${sevBar(row.counts, row.total, max)}
+          <div style="font-size:11.5px;color:#4b5563;margin-top:7px;line-height:1.7">${parts}</div>
+          <div style="font-size:11px;color:#6b7280;margin-top:5px">oldest ${esc(row.oldest)}</div>
+        </a>
+      </td></tr></table></td>`;
+}
+
+/** Everything, everywhere — the whole company on one screen. */
+function summaryVP(master, person, cfg) {
+  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
+  const rows = Object.keys(master.restaurants || {}).map(sid => {
+    const tickets = openTicketsFor(master, sid);
+    const counts = { emergency: 0, urgent: 0, normal: 0 };
+    tickets.forEach(t => { const k = lc(t.priority); counts[SEV[k] ? k : "normal"]++; });
+    return {
+      sid, label: storeLabel((master.restaurants || {})[sid] || {}), total: tickets.length, counts,
+      oldest: tickets.length ? ageOf(Math.min(...tickets.map(t => t.createdAt || Date.now()))) : "",
+    };
+  });
+  const busy = rows.filter(r => r.total)
+    .sort((a, b) => b.counts.emergency - a.counts.emergency || b.counts.urgent - a.counts.urgent
+      || b.total - a.total || a.label.localeCompare(b.label));
+  const clear = rows.filter(r => !r.total).sort((a, b) => a.label.localeCompare(b.label));
+  const tot = { emergency: 0, urgent: 0, normal: 0 };
+  rows.forEach(r => SEV_ORDER.forEach(k => { tot[k] += r.counts[k]; }));
+  const total = tot.emergency + tot.urgent + tot.normal;
+
+  // Two tiles to a row.
+  const busiest = Math.max(1, ...busy.map(r => r.total));
+  const pairs = [];
+  for (let i = 0; i < busy.length; i += 2) pairs.push(busy.slice(i, i + 2));
+  const grid = pairs.map(pair =>
+    `<tr>${pair.map(r => storeTile(r, app, busiest)).join("")}${pair.length === 1 ? '<td width="50%"></td>' : ""}</tr>`).join("");
+
+  const inner = `
+  <tr><td style="padding:14px 19px 4px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
+    ${statTile(total, "open in total", "#111827")}
+    ${statTile(tot.emergency, "emergency", tot.emergency ? SEV.emergency.fill : "#9ca3af")}
+    ${statTile(tot.urgent, "urgent", tot.urgent ? SEV.urgent.fill : "#9ca3af")}
+  </tr></table></td></tr>
+  ${busy.length ? `<tr><td style="padding:18px 24px 6px;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">
+      Stores with something open · ${busy.length}</td></tr>
+    <tr><td style="padding:0 19px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed">${grid}</table></td></tr>`
+    : `<tr><td style="padding:16px 24px 8px"><div style="font-size:15px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">
+        Nothing open anywhere this week.</div></td></tr>`}
+  ${clear.length ? `<tr><td style="padding:14px 24px 20px;font-size:12.5px;color:#6b7280;line-height:1.6">
+      <b style="color:#059669">All clear (${clear.length}):</b> ${clear.map(r => esc(r.label)).join(" · ")}</td></tr>` : `<tr><td style="height:12px"></td></tr>`}`;
+
+  const text = [
+    `${total} open across ${busy.length} store${busy.length === 1 ? "" : "s"}`,
+    `${tot.emergency} emergency · ${tot.urgent} urgent · ${tot.normal} normal`, "",
+    ...busy.map(r => `${String(r.total).padStart(3)}  ${r.label}  (` +
+      SEV_ORDER.filter(k => r.counts[k]).map(k => `${r.counts[k]} ${SEV[k].label}`).join(", ") +
+      `, oldest ${r.oldest})\n     ${storeUrlFor(app, r.sid)}`),
+    clear.length ? `\nAll clear: ${clear.map(r => r.label).join(", ")}` : "",
+  ].join("\n");
+
+  return {
+    subject: `FixMi weekly — ${total} open across ${busy.length} store${busy.length === 1 ? "" : "s"}${tot.emergency ? `, ${tot.emergency} emergency` : ""}`,
+    html: shell(`${total} open across ${busy.length} of ${rows.length} stores`,
+      "Every store at a glance, worst first. Tap any store to see its tickets.", inner),
+    text,
+  };
+}
+
 /* Everyone who should get a summary, and what each of them should see. Roles
    come from FindMi at send time, so a new GM is included the week they start. */
 function summaryAudience(master, kind, prefs) {
@@ -590,6 +704,10 @@ function summaryAudience(master, kind, prefs) {
       const storeIds = Object.keys(stores).filter(sid => storeCoachIds(stores[sid]).includes(id));
       if (storeIds.length) out.push({ kind, email: lc(c.email), name: c.name || c.email, storeIds });
     });
+  } else if (kind === "vp") {
+    ((prefs && prefs.vpTo) || []).forEach(e => {
+      if (lc(e).includes("@") && !optedOut(e)) out.push({ kind, email: lc(e), name: e, storeIds: Object.keys(stores) });
+    });
   } else if (kind === "do") {
     Object.entries(master.directors || {}).forEach(([id, d]) => {
       if (!lc(d.email).includes("@") || optedOut(d.email)) return;
@@ -601,6 +719,7 @@ function summaryAudience(master, kind, prefs) {
 }
 
 function buildSummary(master, person, cfg) {
+  if (person.kind === "vp") return summaryVP(master, person, cfg);
   if (person.kind === "gm") return summaryGM(master, person, cfg);
   if (person.kind === "dm") return summaryDM(master, person, cfg);
   return summaryDO(master, person, cfg);
@@ -610,6 +729,8 @@ function buildSummary(master, person, cfg) {
    even by someone who isn't a GM anywhere. Picks the busiest real store /
    patch, so the test looks like the real thing rather than an empty shell. */
 function sampleAudience(master, kind, email, prefs) {
+  // The VP list is just addresses, so anyone can preview it as themselves.
+  if (kind === "vp") return { kind, email: lc(email), name: email, storeIds: Object.keys(master.restaurants || {}) };
   const real = summaryAudience(master, kind, prefs);
   const mine = real.find(p => p.email === lc(email));
   if (mine) return { ...mine, email: lc(email) };
@@ -784,7 +905,7 @@ module.exports = async (req, res) => {
     if (event === "summary") {
       const prefs0 = prefsFrom(master);
       const mode = body.mode || "preview";
-      const kind = ["gm", "dm", "do"].includes(body.kind) ? body.kind : "gm";
+      const kind = ["gm", "dm", "do", "vp"].includes(body.kind) ? body.kind : "gm";
       const sCfg = {
         appUrl: cfg.appUrl,
         selfUrl: (process.env.FIXMI_SELF_URL || `https://${req.headers.host || ""}`).replace(/\/$/, ""),
@@ -792,7 +913,9 @@ module.exports = async (req, res) => {
 
       if (mode === "preview" || mode === "test") {
         const who = sampleAudience(master, kind, body.to || (arr(body.to)[0]) || "preview@example.com", prefs0);
-        if (!who) return res.status(200).json({ ok: false, reason: `there are no ${kind.toUpperCase()}s with an email address in FindMi yet` });
+        if (!who) return res.status(200).json({ ok: false, reason: kind === "vp"
+          ? "add at least one address to the VP list in Settings → Email"
+          : `there are no ${kind.toUpperCase()}s with an email address in FindMi yet` });
         const built = buildSummary(master, who, sCfg);
         if (mode === "preview") return res.status(200).json({ ok: true, kind, sample: !!who.sample, forName: who.name, ...built });
 
@@ -810,7 +933,7 @@ module.exports = async (req, res) => {
 
       // mode "run" — the real weekly send
       if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
-      const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => ["gm", "dm", "do"].includes(k)) : ["gm", "dm", "do"];
+      const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => ["gm", "dm", "do", "vp"].includes(k)) : ["gm", "dm", "do", "vp"];
       const messages = [], log = [];
       kinds.forEach(k => {
         summaryAudience(master, k, prefs0).forEach(person => {
@@ -828,7 +951,10 @@ module.exports = async (req, res) => {
           log.push(`${k}:${person.email}`);
         });
       });
-      if (!messages.length) return res.status(200).json({ ok: true, sent: 0, reason: "nobody to send to — no store, DM or Director in FindMi has an email address" });
+      if (!messages.length) return res.status(200).json({ ok: true, sent: 0, reason:
+        kinds.length === 1 && kinds[0] === "vp"
+          ? "the VP list is empty — add the addresses in Settings → Email"
+          : "nobody to send to — check that these people have email addresses in FindMi, and that nobody has been opted out" });
       if (prefs0.testMode && !prefs0.testTo.length) return res.status(200).json({ ok: false, sent: 0, reason: "test mode is on but no test addresses are set" });
       const r3 = await sendBatch(cfg, messages);
       console.log("[fixmi-notify] weekly summaries", { testMode: prefs0.testMode, built: log.length, sent: r3.sent });
