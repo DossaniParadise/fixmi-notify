@@ -29,19 +29,27 @@ const arr = v => Array.isArray(v) ? v : (v && typeof v === "object" ? Object.val
 const esc = v => String(v == null ? "" : v).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
-/* "unresolved" leaves the ticket exactly where it is and just says so on the
-   thread. "resolved" moves it to Finished — not Closed: closing is a decision
-   for whoever checks the work and writes the closing notes, and a manager
-   tapping a button in an email is telling us the problem has gone away, not
-   signing the job off. */
+/* Both answers write a comment in the presser's name. Whether one of them
+   also moves the ticket depends on who is pressing it.
+
+   A General Manager is reporting what they can see on the floor: the problem
+   has gone away. That is worth saying on the thread, but it is not a decision
+   about where the ticket sits. A District Manager pressing the same button is
+   making that decision, so theirs moves it to Finished — not Closed, because
+   closing is for whoever checks the work and writes the closing notes. */
 const ANSWERS = {
   unresolved: { text: ts => `This issue is still unresolved as of ${ts}.`, status: null,
                 title: "Thanks — marked as still unresolved",
                 line: id => `We've noted that ${id} is still a problem, and told everyone working on it.` },
-  resolved:   { text: ts => `This issue is resolved as of ${ts}.`, status: "finished",
+  resolved:   { text: ts => `This issue has been resolved as of ${ts}, and the ticket can be closed.`, status: "finished",
                 title: "Thanks — marked as resolved",
-                line: id => `${id} has been moved to Finished and everyone working on it has been told. It stays open until someone closes it off in FixMi.` },
+                line: id => `Your answer is on ${id} and everyone working on it has been told.`,
+                movedLine: id => `${id} has been moved to Finished and everyone working on it has been told.` },
 };
+/* Only these roles carry a press through to the ticket's status. Anyone else —
+   a GM, a forwarded link, an older link with no role on it at all — writes the
+   comment and stops there, which is the harmless half of the action. */
+const MAY_MOVE = { dm: true };
 // Links sent before the wording changed still work.
 const LEGACY = { yes: "unresolved", no: "resolved" };
 
@@ -56,14 +64,29 @@ function stampNow() {
    different link from last week's. Without it, a manager who answered
    "unresolved" last Monday would find the same answer refused as a duplicate
    every week afterwards. */
-function sign(ticketId, answer, email, when) {
+function sign(ticketId, answer, email, when, role) {
   return crypto.createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
-    .update(`${ticketId}|${answer}|${lc(email)}|${when || ""}`).digest("hex").slice(0, 32);
+    .update(`${ticketId}|${answer}|${lc(email)}|${when || ""}${role ? "|" + lc(role) : ""}`).digest("hex").slice(0, 32);
 }
 /** Compare in constant time, so the signature can't be guessed a byte at a time. */
 function sigOk(given, want) {
   const a = Buffer.from(String(given || ""), "utf8"), b = Buffer.from(want, "utf8");
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/* The alignment master sits behind a CDN that will serve a copy up to a minute
+   old. This handler reads a ticket, adds to it and writes the whole thing back,
+   so a stale copy is not a cosmetic problem: a GM answering at 9:00:10 and a DM
+   answering at 9:00:30 would both read the world as it was before either of
+   them pressed, and the second write would erase the first one's comment. A
+   unique query string is a different object to the CDN, so this reaches the
+   origin every time; if the API ever objects to the extra parameter, the plain
+   read still runs. */
+async function readMaster(url) {
+  const opts = { headers: { accept: "application/json", "cache-control": "no-cache" }, cache: "no-store" };
+  const bust = url + (url.includes("?") ? "&" : "?") + "_fresh=" + Date.now().toString(36);
+  const r = await fetch(bust, opts).catch(() => null);
+  return (r && r.ok) ? r : fetch(url, opts);
 }
 
 function page({ title, line, tone, link }) {
@@ -95,6 +118,9 @@ module.exports = async (req, res) => {
     const answer = LEGACY[lc(q.a)] || lc(q.a);
     const email = lc(q.e);
     const when = String(q.w || "").trim();          // the week this went out
+    /* No role on the link means it was built before roles existed. Treat that
+       as the GM case: write the comment, leave the status alone. */
+    const linkRole = lc(q.r) || "gm";
     const secret = process.env.FIXMI_SHARED_SECRET || "";
     const writePass = process.env.FIXMI_WRITE_PASSWORD || "";
     const appUrl = process.env.FIXMI_APP_URL || DEFAULTS.appUrl;
@@ -102,13 +128,14 @@ module.exports = async (req, res) => {
     if (!secret) return html(500, { title: "Not set up yet", line: "FIXMI_SHARED_SECRET is missing on the server, so this link can't be checked.", tone: "bad" });
     if (!ticketId || !ANSWERS[answer] || !email)
       return html(400, { title: "That link is incomplete", line: "Please open the ticket in FixMi and leave a comment there instead.", tone: "bad" });
-    if (!sigOk(q.s, sign(ticketId, answer, email, when)) && !sigOk(q.s, sign(ticketId, lc(q.a), email, when)))
+    if (![sign(ticketId, answer, email, when, q.r ? linkRole : null),
+          sign(ticketId, lc(q.a), email, when, q.r ? linkRole : null)].some(want => sigOk(q.s, want)))
       return html(403, { title: "That link isn't valid", line: "It may have been altered or retyped. Open the ticket in FixMi and comment there instead.", tone: "bad" });
     if (!writePass)
       return html(500, { title: "Not set up yet", line: "FIXMI_WRITE_PASSWORD is missing on the server, so your answer can't be saved.", tone: "bad" });
 
     const masterUrl = process.env.FIXMI_MASTER_URL || DEFAULTS.masterUrl;
-    const r = await fetch(masterUrl, { headers: { accept: "application/json" } });
+    const r = await readMaster(masterUrl);
     if (!r.ok) return html(502, { title: "Couldn't reach FixMi", line: "Please try again in a minute.", tone: "bad" });
     const master = await r.json();
     const ticket = (master[DEFAULTS.ticketsNode] || {})[ticketId];
@@ -147,11 +174,11 @@ module.exports = async (req, res) => {
     });
     const updated = { ...ticket, comments, updatedAt: Date.now() };
 
-    /* Resolved moves it to Finished, with a line on the ticket's own timeline
-       so the move has an author rather than appearing from nowhere. Already
-       finished or closed is left alone — nothing to move, and re-opening a
-       closed ticket from an email would be a nasty surprise. */
-    const moved = spec.status && prevStatus !== spec.status && prevStatus !== "closed";
+    /* A District Manager's "Resolved" moves it to Finished, with a line on the
+       ticket's own timeline so the move has an author rather than appearing
+       from nowhere. Already finished or closed is left alone — nothing to move,
+       and re-opening a closed ticket from an email would be a nasty surprise. */
+    const moved = !!MAY_MOVE[linkRole] && spec.status && prevStatus !== spec.status && prevStatus !== "closed";
     if (moved) {
       updated.status = spec.status;
       updated.activity = [...arr(ticket.activity), {
@@ -186,8 +213,9 @@ module.exports = async (req, res) => {
       console.error("[fixmi-answer] saved, but the notification failed", e && e.message);
     }
 
-    console.log("[fixmi-answer]", ticket.shortId || ticketId, answer, "from", email, moved ? "→ finished" : "");
-    return html(200, { title: spec.title, line: spec.line(ticket.shortId || "this ticket"), link: url });
+    console.log("[fixmi-answer]", ticket.shortId || ticketId, answer, "from", email, `(${linkRole})`, moved ? "→ finished" : "comment only");
+    const shortId = ticket.shortId || "this ticket";
+    return html(200, { title: spec.title, line: (moved && spec.movedLine ? spec.movedLine : spec.line)(shortId), link: url });
   } catch (e) {
     console.error("[fixmi-answer] crashed", e);
     return html(500, { title: "Something went wrong", line: "Please open the ticket in FixMi and leave a comment there instead.", tone: "bad" });
