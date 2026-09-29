@@ -42,20 +42,39 @@ module.exports = async (req, res) => {
     const prefs = ((master.admins || {}).notifyPrefs || {});
     const wk = prefs.weekly || {};
     const now = centralNow();
+    const notify = require("./notify.js");
+    const callNotify = async (body) => {
+      let out = null;
+      await notify({ method: "POST", query: {}, headers: { host: req.headers.host }, body: { secret, ...body } },
+        { status() { return this; }, setHeader() {}, json(o) { out = o; return this; }, end() { return this; } });
+      return out;
+    };
 
+    /* ---- reminders --------------------------------------------------------
+       These run EVERY day, not on the weekly day: a rule that says "seven days
+       after it opens" means seven days, not "the following Monday". Each one
+       is stamped onto its ticket so it doesn't go again tomorrow. */
+    let reminders = null;
+    try {
+      // The sender stamps the tickets itself, so a reminder sent by hand from
+      // Settings and one sent here behave identically.
+      reminders = await callNotify({ event: "reminders", _master: master });
+      if (reminders) {
+        console.log("[fixmi-weekly] reminders", JSON.stringify({ due: (reminders.due || []).length, sent: reminders.sent, stamped: reminders.stamped }));
+        if (reminders.stampError) console.error("[fixmi-weekly] reminders sent but not stamped:", reminders.stampError);
+      }
+    } catch (e) { console.error("[fixmi-weekly] reminder pass failed", e && e.message); }
+
+    const withReminders = (o) => ({ ...o, reminders: reminders ? { due: (reminders.due || []).length, sent: reminders.sent || 0, stamped: reminders.stamped || 0 } : null });
     if (!force) {
-      if (!wk.on) return res.status(200).json({ skipped: true, reason: "weekly summaries are switched off in Settings → Email" });
+      if (!wk.on) return res.status(200).json(withReminders({ skipped: true, reason: "weekly summaries are switched off in Settings → Email" }));
       const want = DAYS.includes(String(wk.day || "").toLowerCase()) ? String(wk.day).toLowerCase() : "monday";
-      if (now.day !== want) return res.status(200).json({ skipped: true, reason: `today is ${now.day}, summaries go out on ${want}` });
-      if (wk.lastSentYmd === now.ymd) return res.status(200).json({ skipped: true, reason: `already sent today (${now.ymd})` });
+      if (now.day !== want) return res.status(200).json(withReminders({ skipped: true, reason: `today is ${now.day}, summaries go out on ${want}` }));
+      if (wk.lastSentYmd === now.ymd) return res.status(200).json(withReminders({ skipped: true, reason: `already sent today (${now.ymd})` }));
     }
 
-    const kinds = Array.isArray(wk.kinds) && wk.kinds.length ? wk.kinds : ["gm", "dm", "do"];
-    const notify = require("./notify.js");
-    let out = null;
-    await notify({ method: "POST", query: {}, headers: { host: req.headers.host }, body: {
-      secret, event: "summary", mode: "run", kinds, _master: master,
-    } }, { status() { return this; }, setHeader() {}, json(o) { out = o; return this; }, end() { return this; } });
+    const kinds = Array.isArray(wk.kinds) && wk.kinds.length ? wk.kinds : ["gm", "dm", "do", "vp"];
+    const out = await callNotify({ event: "summary", mode: "run", kinds, _master: master });
 
     // Remember the day, so nothing goes out twice.
     if (writePass && !force) {
@@ -68,7 +87,7 @@ module.exports = async (req, res) => {
     }
 
     console.log("[fixmi-weekly]", now.ymd, JSON.stringify(out));
-    return res.status(200).json({ ran: true, on: now.ymd, kinds, ...(out || {}) });
+    return res.status(200).json(withReminders({ ran: true, on: now.ymd, kinds, ...(out || {}) }));
   } catch (e) {
     console.error("[fixmi-weekly] crashed", e);
     return res.status(500).json({ error: String((e && e.message) || e) });
