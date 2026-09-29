@@ -1,10 +1,14 @@
 /**
  * The weekly clock.
  *
- * Vercel runs this once a day. It does nothing at all unless the weekly
- * summaries are switched on in Settings → Email AND today is the chosen day in
- * Central time — which means the day can be changed from Settings without
- * touching vercel.json or redeploying anything.
+ * Vercel runs this once a day, at 10:00 UTC — 5am Central while the clocks are
+ * forward, 4am once they go back. Hobby plans only allow one firing a day, so
+ * the hour lives in vercel.json; the DAY lives in Settings → Email, which means
+ * it can be changed without redeploying anything.
+ *
+ * It does nothing at all unless the weekly summaries are switched on AND today
+ * is the chosen day in Central time. When it has finished sending, it posts one
+ * receipt to whoever is listed in Settings saying exactly what went out.
  *
  * It also records the date it last ran, so a retry, a second cron region or a
  * manual poke can't send everybody two copies.
@@ -35,7 +39,11 @@ module.exports = async (req, res) => {
     const writePass = process.env.FIXMI_WRITE_PASSWORD || "";
     const force = String((req.query || {}).force || "") === "1";
 
-    const r = await fetch(masterUrl, { headers: { accept: "application/json" } });
+    /* Same CDN bypass the rest of the pipeline uses: this read decides who gets
+       what, and a copy a minute old can miss a ticket raised overnight. */
+    const readMaster = require("./notify.js").readMaster;
+    const r = readMaster ? await readMaster(masterUrl)
+      : await fetch(masterUrl, { headers: { accept: "application/json" } });
     if (!r.ok) return res.status(502).json({ error: `could not read the master (HTTP ${r.status})` });
     const master = await r.json();
 
@@ -76,6 +84,22 @@ module.exports = async (req, res) => {
     const kinds = Array.isArray(wk.kinds) && wk.kinds.length ? wk.kinds : ["gm", "dm", "do", "vp"];
     const out = await callNotify({ event: "summary", mode: "run", kinds, _master: master });
 
+    /* ---- the receipt ------------------------------------------------------
+       Last, because it reports on everything above it. A failure here must not
+       look like a failure of the send itself, so it is caught and recorded
+       rather than thrown. */
+    let receipt = null;
+    try {
+      receipt = await callNotify({
+        event: "digest", _master: master,
+        summaries: (out && out.manifest) || [],
+        reminders: (reminders && reminders.due) || [],
+        testMode: !!(out && out.testMode),
+        when: `${now.day[0].toUpperCase()}${now.day.slice(1)} ${now.ymd}`,
+      });
+      if (receipt) console.log("[fixmi-weekly] receipt", JSON.stringify({ sent: receipt.sent, to: receipt.to, reason: receipt.reason }));
+    } catch (e) { console.error("[fixmi-weekly] the send worked, the receipt did not", e && e.message); }
+
     // Remember the day, so nothing goes out twice.
     if (writePass && !force) {
       try {
@@ -87,7 +111,8 @@ module.exports = async (req, res) => {
     }
 
     console.log("[fixmi-weekly]", now.ymd, JSON.stringify(out));
-    return res.status(200).json(withReminders({ ran: true, on: now.ymd, kinds, ...(out || {}) }));
+    return res.status(200).json(withReminders({ ran: true, on: now.ymd, kinds, ...(out || {}),
+      receipt: receipt ? { sent: receipt.sent || 0, to: receipt.to || [], reason: receipt.reason } : null }));
   } catch (e) {
     console.error("[fixmi-weekly] crashed", e);
     return res.status(500).json({ error: String((e && e.message) || e) });
