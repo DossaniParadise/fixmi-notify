@@ -528,6 +528,14 @@ function testBanner(person, html) {
     `<b>Test mode.</b> Live, this would have gone to ${esc(person.name)} &lt;${esc(person.email)}&gt;.</td></tr>`);
 }
 
+/* The role goes in the subject so a Director with three hats can tell at a
+   glance which of their summaries this is, and so a forwarded one is
+   self-explanatory. Overwatch gets the VP view, but says Overwatch. */
+const SUMMARY_TAG = { gm: "GM", dm: "DM", do: "DO", vp: "VP", ow: "Overwatch" };
+function summarySubject(kind, rest) {
+  return `FixMi ${SUMMARY_TAG[kind] || "Weekly"} Weekly Summary — ${rest}`;
+}
+
 function shell(title, subtitle, inner) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827">
@@ -549,7 +557,7 @@ function summaryGM(master, person, cfg) {
   const label = storeLabel(store);
   if (!tickets.length) {
     return {
-      subject: `FixMi weekly — ${label}: nothing open`,
+      subject: summarySubject("gm", `${label}: nothing open`),
       html: shell(`Nothing open at ${label}`, "No open tickets this week.",
         `<tr><td style="padding:14px 24px 24px"><div style="font-size:15px;line-height:1.55;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">All clear.</div></td></tr>`),
       text: `Nothing open at ${label}.\n\nNo maintenance tickets are outstanding this week.`,
@@ -581,7 +589,7 @@ function summaryGM(master, person, cfg) {
     ].join("\n")),
   ].join("\n");
   return {
-    subject: `FixMi weekly — ${label}: ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`,
+    subject: summarySubject("gm", `${label}: ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`),
     html: shell(`${tickets.length} open at ${label}`,
       "Resolved moves a ticket to Finished. Unresolved just notes it.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
@@ -620,7 +628,7 @@ function summaryDM(master, person, cfg) {
     ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n${storeUrlFor(app, b.sid)}\n` +
       (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp)}`).join("\n") : "  Nothing open.") + "\n")].join("\n");
   return {
-    subject: `FixMi weekly — ${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
+    subject: summarySubject("dm", `${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`),
     html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
       "Busiest store first.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
@@ -651,7 +659,7 @@ function summaryDO(master, person, cfg) {
   const text = [`${total} open across ${rowsData.length} stores`, "",
     ...rowsData.map(r => `${String(r.n).padStart(3)}  ${r.label}${r.urgent ? `  (${r.urgent} urgent or emergency)` : ""}`)].join("\n");
   return {
-    subject: `FixMi weekly — ${total} open across ${rowsData.length} stores`,
+    subject: summarySubject("do", `${total} open across ${rowsData.length} stores`),
     html: shell(`${total} open across ${rowsData.length} stores`,
       "Most to least.",
       `<tr><td style="padding:14px 24px 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${rows}</table></td></tr>`),
@@ -764,7 +772,7 @@ function summaryVP(master, person, cfg) {
   ].join("\n");
 
   return {
-    subject: `FixMi weekly — ${total} open across ${busy.length} store${busy.length === 1 ? "" : "s"}${tot.emergency ? `, ${tot.emergency} emergency` : ""}`,
+    subject: summarySubject(person.kind === "ow" ? "ow" : "vp", `${total} open across ${busy.length} store${busy.length === 1 ? "" : "s"}${tot.emergency ? `, ${tot.emergency} emergency` : ""}`),
     html: shell(`${total} open across ${busy.length} of ${rows.length} stores`,
       "Worst first.", inner),
     text,
