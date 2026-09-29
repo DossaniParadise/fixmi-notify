@@ -543,7 +543,7 @@ function shell(title, subtitle, inner) {
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#fff;border-radius:12px;overflow:hidden">
   <tr><td style="background:#1d76bb;padding:14px 24px;color:#fff;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">FixMi &nbsp;·&nbsp; Weekly summary</td></tr>
   <tr><td style="padding:22px 24px 4px"><div style="font-size:20px;font-weight:700;line-height:1.3">${esc(title)}</div>
-    <div style="font-size:14px;color:#6b7280;margin-top:5px">${esc(subtitle)}</div></td></tr>
+    ${subtitle ? `<div style="font-size:14px;color:#6b7280;margin-top:5px">${esc(subtitle)}</div>` : ""}</td></tr>
   ${inner}
   <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af;line-height:1.5">
     Dossani Paradise · Repair &amp; Maintenance · sent every week from FixMi</td></tr>
@@ -641,37 +641,7 @@ function summaryDM(master, person, cfg) {
 }
 
 /** The Director's league table: counts only, worst first. */
-function summaryDO(master, person, cfg) {
-  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
-  const rowsData = person.storeIds.map(sid => {
-    const store = (master.restaurants || {})[sid] || {};
-    const tickets = openTicketsFor(master, sid);
-    return {
-      sid, label: storeLabel(store), n: tickets.length,
-      urgent: tickets.filter(t => ["emergency", "urgent"].includes(lc(t.priority))).length,
-      oldest: tickets.length ? Math.min(...tickets.map(t => t.createdAt || Date.now())) : 0,
-    };
-  }).sort((a, b) => b.n - a.n || a.label.localeCompare(b.label));
-  const total = rowsData.reduce((n, r) => n + r.n, 0);
-  const worst = Math.max(1, ...rowsData.map(r => r.n));
-  const rows = rowsData.map(r => `<tr>
-      <td style="padding:7px 10px 7px 0;font-size:14px;border-bottom:1px solid #f3f4f6"><a href="${esc(storeUrlFor(app, r.sid))}" target="_blank" style="color:#111827;text-decoration:none">${esc(r.label)}</a></td>
-      <td style="padding:7px 10px;width:45%;border-bottom:1px solid #f3f4f6">
-        <div style="background:#f3f4f6;border-radius:999px;height:8px"><div style="background:${r.urgent ? "#e8091b" : "#1d76bb"};width:${Math.round((r.n / worst) * 100)}%;height:8px;border-radius:999px"></div></div></td>
-      <td style="padding:7px 0;text-align:right;font-size:14px;font-weight:700;white-space:nowrap;border-bottom:1px solid #f3f4f6">${r.n}${r.urgent ? `<span style="color:#e8091b;font-weight:400;font-size:12px"> · ${r.urgent} urgent+</span>` : ""}</td>
-    </tr>`).join("");
-  const text = [`${total} open across ${rowsData.length} stores`, "",
-    ...rowsData.map(r => `${String(r.n).padStart(3)}  ${r.label}${r.urgent ? `  (${r.urgent} urgent or emergency)` : ""}`)].join("\n");
-  return {
-    subject: summarySubject("do", `${total} open across ${rowsData.length} stores`),
-    html: shell(`${total} open across ${rowsData.length} stores`,
-      "Most to least.",
-      `<tr><td style="padding:14px 24px 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${rows}</table></td></tr>`),
-    text,
-  };
-}
-
-/* ---- the VP view: every store at once, worst first ------------------------
+/* ---- severity, shared by every aggregate view -----------------------------
    Severity colours are validated for colour-blind separation against a white
    email background (ΔE 15.6 normal vision, 9.2 deutan, all ≥3:1 contrast), and
    every count is written out in words beside its colour, so nothing here is
@@ -682,6 +652,13 @@ const SEV = {
   normal:    { fill: "#1d76bb", label: "normal" },
 };
 const SEV_ORDER = ["emergency", "urgent", "normal"];
+const zeroCounts = () => ({ emergency: 0, urgent: 0, normal: 0 });
+function countSeverity(tickets) {
+  const c = zeroCounts();
+  tickets.forEach(t => { const k = lc(t.priority); c[SEV[k] ? k : "normal"]++; });
+  return c;
+}
+const addCounts = (into, from) => { SEV_ORDER.forEach(k => { into[k] += from[k]; }); return into; };
 
 function statTile(n, label, colour) {
   return `<td width="33%" style="padding:0 5px" valign="top">
@@ -691,94 +668,280 @@ function statTile(n, label, colour) {
         <div style="font-size:12px;color:#6b7280;margin-top:3px;text-transform:uppercase;letter-spacing:.05em">${esc(label)}</div>
       </td></tr></table></td>`;
 }
+function statRow(counts) {
+  const total = counts.emergency + counts.urgent + counts.normal;
+  return `<tr><td style="padding:14px 19px 4px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
+    ${statTile(total, "open in total", "#111827")}
+    ${statTile(counts.emergency, "emergency", counts.emergency ? SEV.emergency.fill : "#9ca3af")}
+    ${statTile(counts.urgent, "urgent", counts.urgent ? SEV.urgent.fill : "#9ca3af")}
+  </tr></table></td></tr>`;
+}
 
 /* A thin stacked bar. Its LENGTH is the store's share of the busiest store, so
-   volume is comparable from tile to tile; its segments are the split by
+   volume is comparable from row to row; its segments are the split by
    severity. Measuring each bar against its own total instead would make one
    emergency look the same weight as four tickets. 2px of surface between
    segments rather than a border. */
-function sevBar(counts, total, max) {
+function sevBar(counts, max, marginTop) {
   const scale = Math.max(1, max);
-  const segs = SEV_ORDER.filter(k => counts[k]).map(k =>
+  const keys = SEV_ORDER.filter(k => counts[k]);
+  const segs = keys.map(k =>
     `<td width="${Math.max(3, Math.round((counts[k] / scale) * 100))}%" style="background:${SEV[k].fill};height:8px;border-radius:3px;font-size:0;line-height:0">&nbsp;</td>` +
     `<td width="2" style="font-size:0;line-height:0">&nbsp;</td>`).join("");
-  const used = SEV_ORDER.filter(k => counts[k]).reduce((n, k) => n + Math.max(3, Math.round((counts[k] / scale) * 100)), 0);
+  const used = keys.reduce((n, k) => n + Math.max(3, Math.round((counts[k] / scale) * 100)), 0);
   const rest = Math.max(0, 100 - used);
-  return `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:9px;table-layout:fixed"><tr>${segs}` +
+  return `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:${marginTop == null ? 9 : marginTop}px;table-layout:fixed"><tr>${segs}` +
     (rest ? `<td width="${rest}%" style="font-size:0;line-height:0">&nbsp;</td>` : "") + `</tr></table>`;
 }
 
+/** The colour key, spelled out. `extra` rides along as one more grey item. */
+function sevLegend(counts, extra) {
+  const parts = SEV_ORDER.filter(k => counts[k]).map(k =>
+    `<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${SEV[k].fill}"></span> ${counts[k]} ${SEV[k].label}`);
+  if (extra) parts.push(`<span style="color:#9ca3af">${esc(extra)}</span>`);
+  /* The separator belongs to the item after it and rides inside the same
+     nowrap span, so a legend that wraps never strands a dot at a line end. */
+  return parts.map((html, i) => `<span style="white-space:nowrap">${i ? "&nbsp;·&nbsp; " : ""}${html}</span>`).join(" ");
+}
+function sevWords(counts) {
+  return SEV_ORDER.filter(k => counts[k]).map(k => `${counts[k]} ${SEV[k].label}`).join(", ");
+}
+
+/* ---- what is open, by category -------------------------------------------
+   Before reading store names, a Director wants to know whether this is an
+   equipment week or an IT week. Only the top level counts: a ticket filed as
+   "IT → Network Issues" is one IT ticket. Older records carry the label and
+   nothing else, newer ones carry the key, so read whichever is there. */
+const CAT_TITLE = { it: "IT", pos: "POS", hvac: "HVAC", ops_support: "OPS Support" };
+const titleCat = raw => CAT_TITLE[lc(raw)] || String(raw).replace(/_/g, " ").replace(/\b[a-z]/g, c => c.toUpperCase());
+function topCategory(t) {
+  const fromLabel = String(t.categoryLabel || "").split(/[\u2192\u203a>|]/)[0].trim();
+  /* A label that is already cased is used as it stands — it is what the app
+     shows. Legacy records saved the raw key into the label field, so anything
+     with no capital in it goes through the same tidy-up as a bare key. */
+  if (fromLabel) return /[A-Z]/.test(fromLabel) ? fromLabel : titleCat(fromLabel);
+  return lc(t.category) ? titleCat(t.category) : "Other";
+}
+function categoryCounts(tickets) {
+  const m = new Map();
+  tickets.forEach(t => { const k = topCategory(t); m.set(k, (m.get(k) || 0) + 1); });
+  return [...m.entries()].map(([label, n]) => ({ label, n }))
+    .sort((a, b) => b.n - a.n || a.label.localeCompare(b.label));
+}
+function catGrid(counts) {
+  if (!counts.length) return "";
+  const cells = counts.map(c => `<td width="33%" style="padding:0 5px 10px" valign="top">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f9fafb;border:1px solid #f3f4f6;border-radius:9px">
+        <tr><td style="padding:9px 12px">
+          <div style="font-size:19px;font-weight:800;line-height:1.1">${c.n}</div>
+          <div style="font-size:11.5px;color:#6b7280;margin-top:2px">${esc(c.label)}</div>
+        </td></tr></table></td>`);
+  const rows = [];
+  for (let i = 0; i < cells.length; i += 3) {
+    const row = cells.slice(i, i + 3);
+    while (row.length < 3) row.push('<td width="33%"></td>');
+    rows.push(`<tr>${row.join("")}</tr>`);
+  }
+  return `<tr><td style="padding:17px 24px 3px;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">By category</td></tr>
+    <tr><td style="padding:0 19px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed">${rows.join("")}</table></td></tr>`;
+}
+function catText(counts) {
+  return counts.length ? ["BY CATEGORY", ...counts.map(c => `${String(c.n).padStart(3)}  ${c.label}`), ""].join("\n") : "";
+}
+
+/* One heading that carries a name on the left and its count on the right. */
+function groupHead(name, n, level) {
+  return level === 1
+    ? `<tr><td style="padding:19px 24px 0"><div style="border-top:2px solid #111827;padding-top:9px;font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:.05em">
+        ${esc(name)}<span style="float:right;font-weight:400;color:#6b7280;text-transform:none;letter-spacing:0">${n} open</span></div></td></tr>`
+    : `<tr><td style="padding:13px 24px 5px;font-size:12.5px;font-weight:700;color:#4b5563">
+        ${esc(name)}<span style="float:right;font-weight:400;color:#9ca3af">${n} open</span></td></tr>`;
+}
+
+/* Which Director and which DM a store answers to. A store can carry several
+   DMs; the first is the one it is grouped under, the way FixMi treats it
+   everywhere else. */
+function ownersOf(master, store) {
+  const dir = (master.directors || {})[store.assignedDirectorId];
+  const dm = storeCoachIds(store).map(id => (master.areaCoaches || {})[id]).find(Boolean);
+  return {
+    dirKey: dir ? (lc(dir.email) || lc(dir.name)) : "",
+    dirName: dir ? (dir.name || dir.email) : "No Director assigned",
+    dmKey: dm ? (lc(dm.email) || lc(dm.name)) : "",
+    dmName: dm ? (dm.name || dm.email) : "No District Manager assigned",
+  };
+}
+/* Emergencies first, then urgents, then sheer volume. Anything with nobody
+   assigned to it sinks to the bottom whatever its numbers, because it is a
+   data problem rather than a store problem. */
+const bySeverity = (a, b) => (a.key ? 0 : 1) - (b.key ? 0 : 1)
+  || b.counts.emergency - a.counts.emergency || b.counts.urgent - a.counts.urgent
+  || b.n - a.n || String(a.name).localeCompare(String(b.name));
+
+function groupBy(list, keyOf, nameOf) {
+  const out = [], map = new Map();
+  list.forEach(item => {
+    const k = keyOf(item);
+    let g = map.get(k);
+    if (!g) { g = { key: k, name: nameOf(item), items: [], n: 0, counts: zeroCounts() }; map.set(k, g); out.push(g); }
+    g.items.push(item); g.n += item.total; addCounts(g.counts, item.counts);
+  });
+  return out;
+}
+
+/** The Director's week, split by District Manager. */
+function summaryDO(master, person, cfg) {
+  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
+  const stores = person.storeIds.map(sid => {
+    const store = (master.restaurants || {})[sid] || {};
+    const tickets = openTicketsFor(master, sid);
+    return {
+      sid, label: storeLabel(store), tickets, total: tickets.length,
+      counts: countSeverity(tickets),
+      oldest: tickets.length ? ageOf(Math.min(...tickets.map(t => t.createdAt || Date.now()))) : "",
+      ...ownersOf(master, store),
+    };
+  });
+  const open = stores.filter(s => s.total);
+  const clear = stores.filter(s => !s.total).sort((a, b) => a.label.localeCompare(b.label));
+  const tot = stores.reduce((acc, s) => addCounts(acc, s.counts), zeroCounts());
+  const total = tot.emergency + tot.urgent + tot.normal;
+  const busiest = Math.max(1, ...stores.map(s => s.total));
+
+  const dms = groupBy(open, s => s.dmKey, s => s.dmName).sort(bySeverity);
+  dms.forEach(g => g.items.sort((a, b) => b.counts.emergency - a.counts.emergency
+    || b.counts.urgent - a.counts.urgent || b.total - a.total || a.label.localeCompare(b.label)));
+
+  /* Every cell of the row is the same link. A Director reading this on a phone
+     should not have to find the store name to get anywhere — the bar and the
+     number open the store's list just as the name does. */
+  const storeRow = (s, last) => {
+    const url = esc(storeUrlFor(app, s.sid));
+    const link = inner => `<a href="${url}" target="_blank" style="display:block;color:inherit;text-decoration:none">${inner}</a>`;
+    const rule = last ? "" : "border-bottom:1px solid #f3f4f6;";
+    return `<tr>
+      <td width="40%" style="padding:10px 10px 10px 0;${rule}vertical-align:top">
+        ${link(`<span style="font-size:14px;font-weight:700;color:#1d76bb">${esc(s.label)} &rsaquo;</span>`)}</td>
+      <td width="42%" style="padding:10px;${rule}vertical-align:top">
+        ${link(`${sevBar(s.counts, busiest, 3)}<div style="font-size:11.5px;color:#4b5563;margin-top:6px;line-height:1.7">${sevLegend(s.counts, s.oldest && "oldest " + s.oldest)}</div>`)}</td>
+      <td width="18%" style="padding:10px 0;text-align:right;${rule}vertical-align:top">
+        ${link(`<span style="font-size:19px;font-weight:800;color:#111827">${s.total}</span>`)}</td>
+    </tr>`;
+  };
+
+  const sections = dms.map(g => groupHead(g.name, g.n, 1) +
+    `<tr><td style="padding:2px 24px 0"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed">${g.items.map((s, i) => storeRow(s, i === g.items.length - 1)).join("")}</table></td></tr>`).join("");
+
+  const inner = statRow(tot) + catGrid(categoryCounts(stores.flatMap(s => s.tickets))) +
+    (open.length
+      ? `<tr><td style="padding:17px 24px 0;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">
+          By District Manager<span style="float:right;font-weight:400;text-transform:none;letter-spacing:0;color:#9ca3af">any row opens the store</span></td></tr>${sections}`
+      : `<tr><td style="padding:16px 24px 8px"><div style="font-size:15px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">Nothing open across your stores.</div></td></tr>`) +
+    (clear.length ? `<tr><td style="padding:17px 24px 20px;font-size:12.5px;color:#6b7280;line-height:1.6">
+        <b style="color:#059669">All clear (${clear.length}):</b> ${clear.map(s => esc(s.label)).join(" · ")}</td></tr>` : `<tr><td style="height:14px"></td></tr>`);
+
+  const text = [
+    `${total} open across ${open.length} of ${stores.length} store${stores.length === 1 ? "" : "s"}`,
+    sevWords(tot) || "nothing open", "",
+    catText(categoryCounts(stores.flatMap(s => s.tickets))),
+    ...dms.map(g => [`${g.name.toUpperCase()} — ${g.n} open`,
+      ...g.items.map(s => `${String(s.total).padStart(5)}  ${s.label}  (${sevWords(s.counts)}${s.oldest ? `, oldest ${s.oldest}` : ""})\n         ${storeUrlFor(app, s.sid)}`), ""].join("\n")),
+    clear.length ? `All clear: ${clear.map(s => s.label).join(", ")}` : "",
+  ].filter(x => x !== "").join("\n");
+
+  return {
+    subject: summarySubject("do", `${total} open across ${open.length} store${open.length === 1 ? "" : "s"}${tot.emergency ? `, ${tot.emergency} emergency` : ""}`),
+    html: shell(`${total} open across ${open.length} of ${stores.length} stores`, "", inner),
+    text,
+  };
+}
+
+/* ---- the VP view: every store at once, three to a row, Director then DM --- */
 function storeTile(row, app, max) {
   const worst = SEV_ORDER.find(k => row.counts[k]) || "normal";
-  const parts = SEV_ORDER.filter(k => row.counts[k]).map(k =>
-    `<span style="white-space:nowrap"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${SEV[k].fill}"></span> ${row.counts[k]} ${SEV[k].label}</span>`).join(" &nbsp;·&nbsp; ");
-  return `<td width="50%" style="padding:0 5px 10px" valign="top">
+  /* Every tile lists three severity slots whether or not it has all three,
+     the unused ones as blank space underneath. Percentage heights on a
+     nested table are
+     ignored by most mail clients, so this is what actually makes three tiles
+     in a row finish level with one another. */
+  const listed = SEV_ORDER.filter(k => row.counts[k]);
+  const legend = listed.map(k =>
+    `<div style="white-space:nowrap;margin-top:3px"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${SEV[k].fill}"></span> ${row.counts[k]} ${SEV[k].label}</div>`).join("")
+    + Array(SEV_ORDER.length - listed.length).fill(`<div style="margin-top:3px;font-size:11px;line-height:1.45">&nbsp;</div>`).join("");
+  return `<td width="33%" style="padding:0 5px 10px" valign="top">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-left:4px solid ${SEV[worst].fill};border-radius:10px">
-      <tr><td style="padding:12px 14px">
+      <tr><td style="padding:11px 12px" valign="top">
         <a href="${esc(storeUrlFor(app, row.sid))}" target="_blank" style="color:#111827;text-decoration:none">
-          <div style="font-size:13.5px;font-weight:700;line-height:1.3">${esc(row.label)}</div>
-          <div style="font-size:26px;font-weight:800;line-height:1.1;margin-top:5px">${row.total}<span style="font-size:12px;font-weight:400;color:#6b7280"> open</span></div>
-          ${sevBar(row.counts, row.total, max)}
-          <div style="font-size:11.5px;color:#4b5563;margin-top:7px;line-height:1.7">${parts}</div>
-          <div style="font-size:11px;color:#6b7280;margin-top:5px">oldest ${esc(row.oldest)}</div>
+          <div style="font-size:12.5px;font-weight:700;line-height:1.3;color:#1d76bb">${esc(row.label)} &rsaquo;</div>
+          <div style="font-size:24px;font-weight:800;line-height:1.1;margin-top:5px">${row.total}<span style="font-size:11px;font-weight:400;color:#6b7280"> open</span></div>
+          ${sevBar(row.counts, max, 8)}
+          <div style="font-size:11px;color:#4b5563;margin-top:5px;line-height:1.45">${legend}</div>
+          <div style="font-size:10.5px;color:#9ca3af;margin-top:6px">${row.oldest ? "oldest " + esc(row.oldest) : "&nbsp;"}</div>
         </a>
       </td></tr></table></td>`;
 }
 
-/** Everything, everywhere — the whole company on one screen. */
+/** Everything, everywhere — the whole company, under the people who own it. */
 function summaryVP(master, person, cfg) {
   const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
   const rows = Object.keys(master.restaurants || {}).map(sid => {
+    const store = (master.restaurants || {})[sid] || {};
     const tickets = openTicketsFor(master, sid);
-    const counts = { emergency: 0, urgent: 0, normal: 0 };
-    tickets.forEach(t => { const k = lc(t.priority); counts[SEV[k] ? k : "normal"]++; });
     return {
-      sid, label: storeLabel((master.restaurants || {})[sid] || {}), total: tickets.length, counts,
+      sid, label: storeLabel(store), tickets, total: tickets.length,
+      counts: countSeverity(tickets),
       oldest: tickets.length ? ageOf(Math.min(...tickets.map(t => t.createdAt || Date.now()))) : "",
+      ...ownersOf(master, store),
     };
   });
-  const busy = rows.filter(r => r.total)
-    .sort((a, b) => b.counts.emergency - a.counts.emergency || b.counts.urgent - a.counts.urgent
-      || b.total - a.total || a.label.localeCompare(b.label));
+  const busy = rows.filter(r => r.total);
   const clear = rows.filter(r => !r.total).sort((a, b) => a.label.localeCompare(b.label));
-  const tot = { emergency: 0, urgent: 0, normal: 0 };
-  rows.forEach(r => SEV_ORDER.forEach(k => { tot[k] += r.counts[k]; }));
+  const tot = rows.reduce((acc, r) => addCounts(acc, r.counts), zeroCounts());
   const total = tot.emergency + tot.urgent + tot.normal;
-
-  // Two tiles to a row.
   const busiest = Math.max(1, ...busy.map(r => r.total));
-  const pairs = [];
-  for (let i = 0; i < busy.length; i += 2) pairs.push(busy.slice(i, i + 2));
-  const grid = pairs.map(pair =>
-    `<tr>${pair.map(r => storeTile(r, app, busiest)).join("")}${pair.length === 1 ? '<td width="50%"></td>' : ""}</tr>`).join("");
 
-  const inner = `
-  <tr><td style="padding:14px 19px 4px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
-    ${statTile(total, "open in total", "#111827")}
-    ${statTile(tot.emergency, "emergency", tot.emergency ? SEV.emergency.fill : "#9ca3af")}
-    ${statTile(tot.urgent, "urgent", tot.urgent ? SEV.urgent.fill : "#9ca3af")}
-  </tr></table></td></tr>
-  ${busy.length ? `<tr><td style="padding:18px 24px 6px;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">
-      Stores with something open · ${busy.length}</td></tr>
-    <tr><td style="padding:0 19px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed">${grid}</table></td></tr>`
-    : `<tr><td style="padding:16px 24px 8px"><div style="font-size:15px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">
-        Nothing open anywhere.</div></td></tr>`}
-  ${clear.length ? `<tr><td style="padding:14px 24px 20px;font-size:12.5px;color:#6b7280;line-height:1.6">
-      <b style="color:#059669">All clear (${clear.length}):</b> ${clear.map(r => esc(r.label)).join(" · ")}</td></tr>` : `<tr><td style="height:12px"></td></tr>`}`;
+  /* Director, then DM, then stores. A VP reading down the page is reading an
+     org chart with this week's numbers on it, which is how the conversation
+     afterwards is going to go. */
+  const dirs = groupBy(busy, r => r.dirKey, r => r.dirName).sort(bySeverity);
+  dirs.forEach(d => {
+    d.dms = groupBy(d.items, r => r.dmKey, r => r.dmName).sort(bySeverity);
+    d.dms.forEach(m => m.items.sort((a, b) => b.counts.emergency - a.counts.emergency
+      || b.counts.urgent - a.counts.urgent || b.total - a.total || a.label.localeCompare(b.label)));
+  });
+
+  const grid3 = list => {
+    const out = [];
+    for (let i = 0; i < list.length; i += 3) {
+      const row = list.slice(i, i + 3);
+      out.push(`<tr>${row.map(r => storeTile(r, app, busiest)).join("")}${Array(3 - row.length).fill('<td width="33%"></td>').join("")}</tr>`);
+    }
+    return out.join("");
+  };
+  const sections = dirs.map(d => groupHead(d.name, d.n, 1) + d.dms.map(m => groupHead(m.name, m.n, 2) +
+    `<tr><td style="padding:0 19px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed">${grid3(m.items)}</table></td></tr>`).join("")).join("");
+
+  const inner = statRow(tot) + catGrid(categoryCounts(rows.flatMap(r => r.tickets))) +
+    (busy.length
+      ? `<tr><td style="padding:17px 24px 0;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">
+          Stores with something open · ${busy.length}<span style="float:right;font-weight:400;text-transform:none;letter-spacing:0;color:#9ca3af">any tile opens the store</span></td></tr>${sections}`
+      : `<tr><td style="padding:16px 24px 8px"><div style="font-size:15px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">Nothing open anywhere.</div></td></tr>`) +
+    (clear.length ? `<tr><td style="padding:17px 24px 20px;font-size:12.5px;color:#6b7280;line-height:1.6">
+        <b style="color:#059669">All clear (${clear.length}):</b> ${clear.map(r => esc(r.label)).join(" · ")}</td></tr>` : `<tr><td style="height:14px"></td></tr>`);
 
   const text = [
-    `${total} open across ${busy.length} store${busy.length === 1 ? "" : "s"}`,
-    `${tot.emergency} emergency · ${tot.urgent} urgent · ${tot.normal} normal`, "",
-    ...busy.map(r => `${String(r.total).padStart(3)}  ${r.label}  (` +
-      SEV_ORDER.filter(k => r.counts[k]).map(k => `${r.counts[k]} ${SEV[k].label}`).join(", ") +
-      `, oldest ${r.oldest})\n     ${storeUrlFor(app, r.sid)}`),
-    clear.length ? `\nAll clear: ${clear.map(r => r.label).join(", ")}` : "",
-  ].join("\n");
+    `${total} open across ${busy.length} of ${rows.length} store${rows.length === 1 ? "" : "s"}`,
+    sevWords(tot) || "nothing open", "",
+    catText(categoryCounts(rows.flatMap(r => r.tickets))),
+    ...dirs.map(d => [`${d.name.toUpperCase()} — ${d.n} open`,
+      ...d.dms.map(m => [`  ${m.name} — ${m.n} open`,
+        ...m.items.map(r => `${String(r.total).padStart(7)}  ${r.label}  (${sevWords(r.counts)}${r.oldest ? `, oldest ${r.oldest}` : ""})\n           ${storeUrlFor(app, r.sid)}`)].join("\n")), ""].join("\n")),
+    clear.length ? `All clear: ${clear.map(r => r.label).join(", ")}` : "",
+  ].filter(x => x !== "").join("\n");
 
   return {
     subject: summarySubject(person.kind === "ow" ? "ow" : "vp", `${total} open across ${busy.length} store${busy.length === 1 ? "" : "s"}${tot.emergency ? `, ${tot.emergency} emergency` : ""}`),
-    html: shell(`${total} open across ${busy.length} of ${rows.length} stores`,
-      "Worst first.", inner),
+    html: shell(`${total} open across ${busy.length} of ${rows.length} stores`, "", inner),
     text,
   };
 }
