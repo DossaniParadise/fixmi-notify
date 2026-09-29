@@ -7,6 +7,6 @@
     "api/weekly.js": { "maxDuration": 60 }
   },
   "crons": [
-    { "path": "/api/weekly", "schedule": "0 13 * * *" }
+    { "path": "/api/weekly", "schedule": "0 10 * * *" }
   ]
 }
