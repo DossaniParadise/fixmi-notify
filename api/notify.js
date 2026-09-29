@@ -76,6 +76,7 @@ const PREF_DEFAULTS = {
   testMode: false, testTo: [], alwaysTo: [],
   /* The VP summary has no role behind it — it goes to a named list. */
   vpTo: [],
+  digestTo: [],
   /* Nudges for tickets that are waiting on the store rather than on a tech.
      This one ships switched on so the feature works the moment both files are
      deployed, rather than waiting for somebody to open Settings and press
@@ -145,7 +146,7 @@ function prefsFrom(master) {
         if (Object.keys(rec).length) p.people[e] = rec;
       });
     }
-    ["testTo", "alwaysTo", "vpTo"].forEach(k => {
+    ["testTo", "alwaysTo", "vpTo", "digestTo"].forEach(k => {
       const v = raw[k];
       p[k] = (Array.isArray(v) ? v : String(v || "").split(/[,;\s]+/)).map(lc).filter(e => e.includes("@"));
     });
@@ -552,17 +553,17 @@ function testBanner(person, html) {
 /* The role goes in the subject so a Director with three hats can tell at a
    glance which of their summaries this is, and so a forwarded one is
    self-explanatory. Overwatch gets the VP view, but says Overwatch. */
-const SUMMARY_TAG = { gm: "GM", dm: "DM", do: "DO", vp: "VP", ow: "Overwatch" };
+const SUMMARY_TAG = { gm: "GM", dm: "DM", do: "DO", vp: "VP", ow: "Overwatch", tech: "Tech" };
 function summarySubject(kind, rest) {
   return `FixMi ${SUMMARY_TAG[kind] || "Weekly"} Weekly Summary — ${rest}`;
 }
 
-function shell(title, subtitle, inner) {
+function shell(title, subtitle, inner, band) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f4f6"><tr><td align="center" style="padding:24px 12px">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#fff;border-radius:12px;overflow:hidden">
-  <tr><td style="background:#1d76bb;padding:14px 24px;color:#fff;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">FixMi &nbsp;·&nbsp; Weekly summary</td></tr>
+  <tr><td style="background:#1d76bb;padding:14px 24px;color:#fff;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">FixMi &nbsp;·&nbsp; ${esc(band || "Weekly summary")}</td></tr>
   <tr><td style="padding:22px 24px 4px"><div style="font-size:20px;font-weight:700;line-height:1.3">${esc(title)}</div>
     ${subtitle ? `<div style="font-size:14px;color:#6b7280;margin-top:5px">${esc(subtitle)}</div>` : ""}</td></tr>
   ${inner}
@@ -877,6 +878,66 @@ function summaryDO(master, person, cfg) {
   };
 }
 
+/* Every summary kind this function knows how to build. */
+const SUMMARY_KINDS = ["gm", "dm", "do", "vp", "ow", "tech"];
+
+/** Everything dispatched to one technician by name, wherever it is. */
+function techTickets(master, techId) {
+  return Object.entries(master.maintenanceTickets || {})
+    .filter(([, t]) => t && t.assignedTechId === techId && OPEN_STATUSES.includes(t.status))
+    .map(([id, t]) => ({ ...t, _id: id }))
+    .sort((a, b) => (PRI_RANK[a.priority] === undefined ? 2 : PRI_RANK[a.priority]) - (PRI_RANK[b.priority] === undefined ? 2 : PRI_RANK[b.priority])
+      || (a.createdAt || 0) - (b.createdAt || 0));
+}
+
+/* ---- the technician's worklist -------------------------------------------
+   Grouped by store, because that is how the week is actually driven: one trip
+   per site. Within a store the worst thing comes first. The two buttons only
+   ever leave a comment — a technician saying "that one's done" is a report
+   from the field, and moving the ticket on stays with the District Manager. */
+function summaryTech(master, person, cfg) {
+  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
+  const tickets = techTickets(master, person.techId);
+  const byStore = [];
+  const seen = new Map();
+  tickets.forEach(t => {
+    let g = seen.get(t.storeId);
+    if (!g) {
+      g = { sid: t.storeId, label: storeLabel((master.restaurants || {})[t.storeId] || {}), tickets: [] };
+      seen.set(t.storeId, g); byStore.push(g);
+    }
+    g.tickets.push(t);
+  });
+  byStore.sort((a, b) => b.tickets.length - a.tickets.length || a.label.localeCompare(b.label));
+
+  const rows = byStore.map(g => `<tr><td style="padding:0 24px 16px">
+      <div style="font-size:14px;font-weight:700;border-bottom:1px solid #e5e7eb;padding-bottom:5px">
+        <a href="${esc(storeUrlFor(app, g.sid))}" target="_blank" style="color:#111827;text-decoration:none">${esc(g.label)} <span style="color:#1d76bb;font-size:12px;font-weight:400">view store &rsaquo;</span></a>
+        <span style="float:right;color:#6b7280;font-weight:400">${g.tickets.length} assigned</span></div>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13.5px;line-height:1.5;margin-top:7px">${
+        g.tickets.map(t => `<tr>
+          <td style="padding:8px 8px 14px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
+          <td style="padding:8px 0 14px;vertical-align:top">
+            <a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="color:#111827;text-decoration:none">
+              <b style="color:#1d76bb">${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
+              <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a>
+            <div style="font-size:14px;line-height:1.5;color:#111827;margin-top:4px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
+            <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, "sm", "tech")}</div></td></tr>`).join("")
+      }</table></td></tr>`).join("");
+
+  const text = [`${tickets.length} ticket${tickets.length === 1 ? "" : "s"} assigned to you across ${byStore.length} store${byStore.length === 1 ? "" : "s"}`, "",
+    ...byStore.map(g => `${g.label} — ${g.tickets.length} assigned\n${storeUrlFor(app, g.sid)}\n` +
+      g.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp, "tech")}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp, "tech")}`).join("\n\n") + "\n")].join("\n");
+
+  return {
+    subject: summarySubject("tech", `${tickets.length} assigned to you across ${byStore.length} store${byStore.length === 1 ? "" : "s"}`),
+    html: shell(`${tickets.length} assigned to you`,
+      "Busiest store first. Either answer leaves a note on the ticket.",
+      `<tr><td style="height:10px"></td></tr>${rows}`),
+    text,
+  };
+}
+
 /* ---- the VP view: every store at once, three to a row, Director then DM --- */
 function storeTile(row, app, max) {
   const worst = SEV_ORDER.find(k => row.counts[k]) || "normal";
@@ -963,6 +1024,88 @@ function summaryVP(master, person, cfg) {
   return {
     subject: summarySubject(person.kind === "ow" ? "ow" : "vp", `${total} open across ${busy.length} store${busy.length === 1 ? "" : "s"}${tot.emergency ? `, ${tot.emergency} emergency` : ""}`),
     html: shell(`${total} open across ${busy.length} of ${rows.length} stores`, "", inner),
+    text,
+  };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   THE MONDAY RECEIPT
+
+   The weekly run sends dozens of emails to people who mostly will not reply.
+   Without a receipt the only way to know it worked is to ask someone whether
+   they got theirs. This is the list: every summary, every reminder, who it
+   went to, and which ones Postmark refused.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+const KIND_PLURAL = { gm: "General Managers", dm: "District Managers", do: "Directors", vp: "VP list", ow: "Overwatch", tech: "Repair technicians" };
+const KIND_ORDER = ["ow", "vp", "do", "dm", "gm", "tech"];
+
+/** Who gets the receipt: the addresses set in Settings, or Overwatch. */
+function digestAudience(master, prefs) {
+  const set = arr(prefs.digestTo).map(lc).filter(e => e.includes("@"));
+  if (set.length) return [...new Set(set)];
+  const ow = Object.values(master.admins || {})
+    .filter(a => a && lc(a.tier) === "overwatch" && lc(a.email).includes("@")).map(a => lc(a.email));
+  return [...new Set(ow)];
+}
+
+function digestBody({ summaries, reminders, testMode, when, appUrl }) {
+  /* Counted in EMAILS, not rows. One reminder rule can nudge a GM and a DM,
+     and in test mode one person's summary becomes one message per test
+     address — so a row is not reliably one email. */
+  const nTo = r => Math.max(1, arr(r.to).length);
+  const emails = rows => rows.reduce((n, r) => n + nTo(r), 0);
+  const total = emails(summaries) + emails(reminders);
+  const failed = emails(summaries.filter(r => !r.ok)) + emails(reminders.filter(r => !r.ok));
+
+  const groups = KIND_ORDER
+    .map(k => ({ k, rows: summaries.filter(r => r.kind === k) }))
+    .filter(g => g.rows.length);
+
+  const line = (label, sub, ok, to) => `<tr>
+    <td style="padding:7px 10px 7px 0;font-size:13.5px;border-bottom:1px solid #f3f4f6;vertical-align:top">
+      <b>${esc(label)}</b><div style="color:#6b7280;font-size:12px;margin-top:2px">${esc(sub)}</div></td>
+    <td style="padding:7px 0;text-align:right;font-size:12px;white-space:nowrap;border-bottom:1px solid #f3f4f6;vertical-align:top">
+      ${ok ? '<span style="color:#059669;font-weight:700">sent</span>'
+           : '<span style="color:#c81e1e;font-weight:700">FAILED</span>'}
+      <div style="color:#9ca3af;margin-top:2px">${esc(to)}</div></td></tr>`;
+
+  const inner = `
+  <tr><td style="padding:14px 19px 4px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
+    ${statTile(total, "emails sent", "#111827")}
+    ${statTile(emails(summaries), "summaries", "#1d76bb")}
+    ${statTile(failed, "failed", failed ? "#c81e1e" : "#9ca3af")}
+  </tr></table></td></tr>
+  ${testMode ? `<tr><td style="padding:14px 24px 0"><div style="background:#fffbeb;border:1px solid #fde68a;border-radius:9px;padding:12px 14px;font-size:13px;color:#92400e">
+      <b>Test mode was on.</b> Nobody in the list below received their own copy — everything went to the test addresses instead.</div></td></tr>` : ""}
+  ${failed ? `<tr><td style="padding:14px 24px 0"><div style="background:#fef2f2;border:1px solid #fecaca;border-radius:9px;padding:12px 14px;font-size:13px;color:#991b1b">
+      <b>${failed} did not go out.</b> They are marked below. Postmark's Activity page says why.</div></td></tr>` : ""}
+  ${groups.map(g => `<tr><td style="padding:17px 24px 0;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">
+      ${esc(KIND_PLURAL[g.k] || g.k)} · ${g.rows.length}</td></tr>
+    <tr><td style="padding:2px 24px 0"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${
+      g.rows.map(r => line(r.name || r.email, r.subject, r.ok, arr(r.to).join(", ") || r.email)).join("")
+    }</table></td></tr>`).join("")}
+  ${reminders.length ? `<tr><td style="padding:17px 24px 0;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">
+      Reminders · ${reminders.length}</td></tr>
+    <tr><td style="padding:2px 24px 0"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${
+      reminders.map(r => line(`${r.shortId || ""} — ${r.rule || "Reminder"}`, r.store || "", r.ok, arr(r.to).join(", "))).join("")
+    }</table></td></tr>` : ""}
+  ${!total ? `<tr><td style="padding:16px 24px 8px"><div style="font-size:15px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:9px;padding:14px 16px">
+      Nothing went out this morning.</div></td></tr>` : `<tr><td style="height:16px"></td></tr>`}`;
+
+  const text = [
+    `${total} email${total === 1 ? "" : "s"} sent${failed ? `, ${failed} FAILED` : ""}`,
+    testMode ? "TEST MODE was on — everything went to the test addresses." : "", "",
+    ...groups.map(g => [`${(KIND_PLURAL[g.k] || g.k).toUpperCase()} (${g.rows.length})`,
+      ...g.rows.map(r => `  ${r.ok ? "sent  " : "FAILED"}  ${r.name || r.email} <${arr(r.to).join(", ") || r.email}>\n          ${r.subject}`), ""].join("\n")),
+    reminders.length ? ["REMINDERS (" + reminders.length + ")",
+      ...reminders.map(r => `  ${r.ok ? "sent  " : "FAILED"}  ${r.shortId || ""} — ${r.rule || "Reminder"} → ${arr(r.to).join(", ")}`), ""].join("\n") : "",
+    `FixMi: ${appUrl}`,
+  ].filter(x => x !== "").join("\n");
+
+  return {
+    subject: `FixMi Weekly Send Receipt — ${total} email${total === 1 ? "" : "s"}${failed ? `, ${failed} failed` : ""}${testMode ? " (test mode)" : ""}`,
+    html: shell(`${total} email${total === 1 ? "" : "s"} went out`, when || "", inner, "Weekly send receipt"),
     text,
   };
 }
@@ -1128,6 +1271,16 @@ function summaryAudience(master, kind, prefs) {
     ((prefs && prefs.vpTo) || []).forEach(e => {
       if (lc(e).includes("@") && !optedOut(e)) out.push({ kind, email: lc(e), name: e, storeIds: Object.keys(stores) });
     });
+  } else if (kind === "tech") {
+    /* A technician's week is their own worklist: the tickets dispatched to
+       them by name, wherever those happen to be. Anyone with nothing assigned
+       is left out rather than sent an empty page. */
+    Object.entries(master.repairTechnicians || {}).forEach(([id, t]) => {
+      if (!lc(t.email).includes("@") || optedOut(t.email)) return;
+      const tickets = Object.entries(master.maintenanceTickets || {})
+        .filter(([, tk]) => tk && tk.assignedTechId === id && OPEN_STATUSES.includes(tk.status));
+      if (tickets.length) out.push({ kind, email: lc(t.email), name: t.name || t.email, techId: id });
+    });
   } else if (kind === "do") {
     Object.entries(master.directors || {}).forEach(([id, d]) => {
       if (!lc(d.email).includes("@") || optedOut(d.email)) return;
@@ -1142,6 +1295,7 @@ function buildSummary(master, person, cfg) {
   if (person.kind === "vp" || person.kind === "ow") return summaryVP(master, person, cfg);
   if (person.kind === "gm") return summaryGM(master, person, cfg);
   if (person.kind === "dm") return summaryDM(master, person, cfg);
+  if (person.kind === "tech") return summaryTech(master, person, cfg);
   return summaryDO(master, person, cfg);
 }
 
@@ -1155,7 +1309,8 @@ function sampleAudience(master, kind, email, prefs) {
   const mine = real.find(p => p.email === lc(email));
   if (mine) return { ...mine, email: lc(email) };
   const busiest = real.map(p => ({
-    p, n: (p.kind === "gm" ? [p.storeId] : p.storeIds).reduce((n, sid) => n + openTicketsFor(master, sid).length, 0),
+    p, n: p.kind === "tech" ? techTickets(master, p.techId).length
+      : (p.kind === "gm" ? [p.storeId] : p.storeIds).reduce((n, sid) => n + openTicketsFor(master, sid).length, 0),
   })).sort((a, b) => b.n - a.n)[0];
   if (busiest) return { ...busiest.p, email: lc(email), sample: true };
   return null;
@@ -1176,7 +1331,7 @@ module.exports = async (req, res) => {
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
     if (secret !== want) return res.status(401).json({ error: "bad secret" });
-    const DIAG = ["selftest", "sendtest", "postmark", "summary", "reminders"];
+    const DIAG = ["selftest", "sendtest", "postmark", "summary", "reminders", "digest"];
     if (!EVENTS.includes(event) && !DIAG.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
     if (!ticketId && !DIAG.includes(event)) return res.status(400).json({ error: "ticketId is required" });
 
@@ -1325,7 +1480,7 @@ module.exports = async (req, res) => {
     if (event === "summary") {
       const prefs0 = prefsFrom(master);
       const mode = body.mode || "preview";
-      const kind = ["gm", "dm", "do", "vp", "ow"].includes(body.kind) ? body.kind : "gm";
+      const kind = SUMMARY_KINDS.includes(body.kind) ? body.kind : "gm";
       const sCfg = {
         appUrl: cfg.appUrl,
         selfUrl: (process.env.FIXMI_SELF_URL || `https://${req.headers.host || ""}`).replace(/\/$/, ""),
@@ -1379,11 +1534,12 @@ module.exports = async (req, res) => {
 
       // mode "run" — the real weekly send
       if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
-      const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => ["gm", "dm", "do", "vp", "ow"].includes(k)) : ["gm", "dm", "do", "vp"];
-      const messages = [], log = [];
+      const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => SUMMARY_KINDS.includes(k)) : ["gm", "dm", "do", "vp"];
+      const messages = [], log = [], manifest = [];
       kinds.forEach(k => {
         summaryAudience(master, k, prefs0).forEach(person => {
           const built = buildSummary(master, person, sCfg);
+          manifest.push({ kind: k, name: person.name, email: person.email, subject: built.subject });
           // Test mode: everything goes to the test addresses instead, and says
           // whose summary it is so a pile of them is still readable.
           const targets = prefs0.testMode ? prefs0.testTo : [person.email];
@@ -1403,8 +1559,75 @@ module.exports = async (req, res) => {
           : "nobody to send to — check that these people have email addresses in FindMi, and that nobody has been opted out" });
       if (prefs0.testMode && !prefs0.testTo.length) return res.status(200).json({ ok: false, sent: 0, reason: "test mode is on but no test addresses are set" });
       const r3 = await sendBatch(cfg, messages);
+      /* One manifest row per PERSON, not per message: in test mode one person's
+         summary becomes several messages, and the receipt should still read as
+         a list of who was covered. A person counts as delivered when every
+         message carrying their summary went out. */
+      let mi = 0;
+      manifest.forEach(row => {
+        const n = prefs0.testMode ? Math.max(1, prefs0.testTo.length) : 1;
+        const slice = r3.perMessage.slice(mi, mi + n); mi += n;
+        row.to = messages.slice(mi - n, mi).map(m => m.To);
+        row.ok = slice.length > 0 && slice.every(x => x.ok);
+      });
       console.log("[fixmi-notify] weekly summaries", { testMode: prefs0.testMode, built: log.length, sent: r3.sent });
-      return res.status(200).json({ ok: r3.ok, sent: r3.sent, testMode: prefs0.testMode, people: log, failed: r3.failed });
+      return res.status(200).json({ ok: r3.ok, sent: r3.sent, testMode: prefs0.testMode, people: log, failed: r3.failed, manifest });
+    }
+
+    /* ---- THE RECEIPT -------------------------------------------------------
+       Posted by the weekly clock once the morning's sending is done, with the
+       manifests the summary and reminder passes handed back. It is a report on
+       what already happened, so it never re-sends anything and it goes out even
+       when the run was in test mode — that is exactly when you want to read it.
+       mode "preview" builds it without sending, for the button in Settings. */
+    if (event === "digest") {
+      const prefs0 = prefsFrom(master);
+      let summaries = arr(body.summaries).filter(r => r && typeof r === "object");
+      let reminders = arr(body.reminders).filter(r => r && typeof r === "object");
+      /* A preview with no manifest behind it builds one from the people who
+         WOULD be emailed on the next run, so what you are looking at is this
+         Monday's receipt rather than a mock-up with invented names. */
+      if (body.mode === "preview" && !summaries.length) {
+        const dCfg = {
+          appUrl: cfg.appUrl,
+          selfUrl: (process.env.FIXMI_SELF_URL || `https://${req.headers.host || ""}`).replace(/\/$/, ""),
+          stamp: todayStamp(),
+        };
+        const saved = ((master.admins || {}).notifyPrefs || {}).weekly || {};
+        const asked = arr(body.dryKinds).filter(k => SUMMARY_KINDS.includes(k));
+        const kinds = asked.length ? asked
+          : (arr(saved.kinds).filter(k => SUMMARY_KINDS.includes(k)));
+        (kinds.length ? kinds : ["gm", "dm", "do", "vp"]).forEach(k => {
+          summaryAudience(master, k, prefs0).forEach(person => summaries.push({
+            kind: k, name: person.name, email: person.email, to: [person.email], ok: true,
+            subject: buildSummary(master, person, dCfg).subject,
+          }));
+        });
+        if (!reminders.length) {
+          reminders = dueReminders(master, prefs0, Date.now()).map(d => ({
+            rule: d.rule.name, shortId: d.ticket.shortId || d.id,
+            store: storeLabel((master.restaurants || {})[d.ticket.storeId] || {}),
+            to: d.people.map(x => x.email), ok: true,
+          }));
+        }
+      }
+      const built = digestBody({
+        summaries, reminders,
+        testMode: !!body.testMode,
+        when: body.when || new Date().toLocaleString("en-US", { timeZone: "America/Chicago", weekday: "long", month: "long", day: "numeric", hour: "numeric", minute: "2-digit" }),
+        appUrl: cfg.appUrl,
+      });
+      const to = digestAudience(master, prefs0);
+      if (body.mode === "preview") return res.status(200).json({ ok: true, preview: true, to, ...built });
+      if (!to.length) return res.status(200).json({ ok: true, sent: 0, reason: "no receipt address is set — add one in Settings → Email" });
+      if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+      const r4 = await sendBatch(cfg, to.map(addr => ({
+        From: `FixMi <${cfg.from}>`, To: addr, Subject: built.subject,
+        HtmlBody: built.html, TextBody: built.text,
+        MessageStream: cfg.stream, Tag: "weekly-receipt", TrackOpens: false, TrackLinks: "None",
+      })));
+      console.log("[fixmi-notify] weekly receipt →", to.join(", "), r4.sent, "sent");
+      return res.status(200).json({ ok: r4.ok, sent: r4.sent, to, subject: built.subject, failed: r4.failed });
     }
 
     /* ---- REMINDERS ---------------------------------------------------------
@@ -1421,6 +1644,7 @@ module.exports = async (req, res) => {
         store: storeLabel((master.restaurants || {})[d.ticket.storeId] || {}),
         openFor: agePhrase(d.ticket.createdAt),
         to: d.people.map(p => p.email),
+        ok: false,                       // set below once Postmark has answered
       }));
       if (body.mode === "due" || !prefs0.on) {
         return res.status(200).json({ ok: true, due: rows, sent: 0,
@@ -1453,6 +1677,11 @@ module.exports = async (req, res) => {
          later. Only tickets that actually got an email are stamped. */
       const landed = new Set();
       rr.perMessage.forEach((m, i) => { if (m.ok && owner[i] !== undefined) landed.add(owner[i]); });
+      // A rule counts as sent once every nudge it produced went out.
+      due.forEach((d, di) => {
+        const mine = rr.perMessage.filter((m, i) => owner[i] === di);
+        rows[di].ok = mine.length > 0 && mine.every(m => m.ok);
+      });
       let stamped = 0, stampError = null;
       const writePass = process.env.FIXMI_WRITE_PASSWORD || "";
       if (landed.size && writePass) {
@@ -1599,6 +1828,7 @@ module.exports = async (req, res) => {
   }
 };
 
+module.exports.readMaster = readMaster;
 module.exports.recipientsFor = recipientsFor;
 module.exports.prefsFrom = prefsFrom;
 module.exports.bodyFor = bodyFor;
