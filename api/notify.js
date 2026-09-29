@@ -881,6 +881,166 @@ function summaryDO(master, person, cfg) {
 /* Every summary kind this function knows how to build. */
 const SUMMARY_KINDS = ["gm", "dm", "do", "vp", "ow", "tech"];
 
+/* ════════════════════════════════════════════════════════════════════════════
+   GEOGRAPHIC ZONES
+
+   Four zones, worked out from where the stores actually are rather than from
+   a list somebody has to maintain. Buy three stores in Tyler and the eastern
+   zone grows to meet them; nobody edits anything.
+
+   k-means on latitude and longitude, k = 4. Two details matter more than the
+   algorithm:
+
+     • It is DETERMINISTIC. The seeds are picked by spreading evenly through
+       the stores sorted north-to-south, never at random, so Monday's email
+       and the app agree, and so the same week's zones don't drift between
+       one run and the next.
+
+     • Longitude is scaled by cos(latitude) before any distance is measured.
+       At 33°N a degree of longitude is about 58 miles against 69 for a
+       degree of latitude; skip this and the clusters come out stretched
+       east-west and the names stop matching the map.
+
+   Naming is a separate step. Each zone's centre is compared with the middle
+   of all of them, and the four compass words are handed out by trying all 24
+   arrangements and keeping the one that fits best overall. That guarantees
+   four different names — a greedy pass would happily call two zones North.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+const ZONE_K = 4;
+const DEG = Math.PI / 180;
+
+function storePoint(store) {
+  const lat = parseFloat(store && store.latitude), lng = parseFloat(store && store.longitude);
+  return (isFinite(lat) && isFinite(lng)) ? { lat, lng } : null;
+}
+/* Flat-earth is fine over one metro: x in "latitude-equivalent degrees". */
+const projX = (p, lat0) => p.lng * Math.cos(lat0 * DEG);
+
+/* Seeds by farthest-point, starting from a given store: each next seed is
+   whichever store is furthest from every seed so far. Deterministic, and it
+   finds corners — but on its own it chases outliers, so it is run from
+   several starting points below and the best result is kept. */
+function seedFarthest(xy, k, first) {
+  const d2 = (a, b) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
+  const picked = [first];
+  while (picked.length < k) {
+    let best = -1, bestD = -1;
+    for (let i = 0; i < xy.length; i++) {
+      if (picked.includes(i)) continue;
+      let near = Infinity;
+      for (const j of picked) near = Math.min(near, d2(xy[i], xy[j]));
+      if (near > bestD + 1e-12) { bestD = near; best = i; }   // ties keep the earlier store
+    }
+    if (best < 0) break;
+    picked.push(best);
+  }
+  return picked.map(i => ({ x: xy[i].x, y: xy[i].y }));
+}
+
+/** One run of Lloyd's algorithm from a given seeding. */
+function lloyd(xy, cent) {
+  let assign = xy.map(() => -1);
+  for (let pass = 0; pass < 60; pass++) {
+    let moved = false;
+    xy.forEach((p, idx) => {
+      let best = 0, bestD = Infinity;
+      cent.forEach((c, j) => {
+        const d = (p.x - c.x) ** 2 + (p.y - c.y) ** 2;
+        if (d < bestD - 1e-12) { bestD = d; best = j; }       // ties keep the lower zone index
+      });
+      if (assign[idx] !== best) { assign[idx] = best; moved = true; }
+    });
+    const sums = cent.map(() => ({ x: 0, y: 0, n: 0 }));
+    xy.forEach((p, idx) => { const s = sums[assign[idx]]; s.x += p.x; s.y += p.y; s.n++; });
+    cent = cent.map((c, j) => sums[j].n ? { x: sums[j].x / sums[j].n, y: sums[j].y / sums[j].n } : c);
+    if (!moved && pass) break;
+  }
+  const inertia = xy.reduce((n, p, idx) => {
+    const c = cent[assign[idx]];
+    return n + (p.x - c.x) ** 2 + (p.y - c.y) ** 2;
+  }, 0);
+  return { assign, cent, inertia };
+}
+
+/* A single farthest-point run is at the mercy of whichever store happens to
+   be most remote: acquire five in East Texas and the seeds go out to meet
+   them, leaving every DFW store in one lump called North. So the same run is
+   repeated from a spread of deterministic starting stores and the tightest
+   result wins. Ties go to the earlier start, so the answer never wobbles. */
+const ZONE_RESTARTS = 12;
+function kmeans(points, k) {
+  const lat0 = points.reduce((n, p) => n + p.lat, 0) / points.length;
+  const xy = points.map(p => ({ x: projX(p, lat0), y: p.lat }));
+  const starts = new Set();
+  const mid = { x: xy.reduce((n, p) => n + p.x, 0) / xy.length, y: xy.reduce((n, p) => n + p.y, 0) / xy.length };
+  let nearest = 0;
+  xy.forEach((p, i) => {
+    const d = (p.x - mid.x) ** 2 + (p.y - mid.y) ** 2;
+    const b = (xy[nearest].x - mid.x) ** 2 + (xy[nearest].y - mid.y) ** 2;
+    if (d < b - 1e-12) nearest = i;
+  });
+  starts.add(nearest);
+  for (let t = 0; t < ZONE_RESTARTS; t++) starts.add(Math.floor(t * xy.length / ZONE_RESTARTS));
+  let best = null;
+  [...starts].forEach(first => {
+    const r = lloyd(xy, seedFarthest(xy, k, first));
+    if (!best || r.inertia < best.inertia - 1e-12) best = r;
+  });
+  return { assign: best.assign, cent: best.cent, lat0 };
+}
+
+const COMPASS = ["North", "South", "East", "West"];
+/* How well a centre sits in each direction, measured from the middle of all
+   the centres and normalised by the spread so a wide, short region is not
+   forced into East and West for everything. */
+function directionScores(c, mid, span) {
+  const dy = (c.y - mid.y) / span.y, dx = (c.x - mid.x) / span.x;
+  return { North: dy, South: -dy, East: dx, West: -dx };
+}
+function nameZones(cent) {
+  const mid = { x: cent.reduce((n, c) => n + c.x, 0) / cent.length, y: cent.reduce((n, c) => n + c.y, 0) / cent.length };
+  const span = {
+    x: Math.max(1e-9, Math.max(...cent.map(c => c.x)) - Math.min(...cent.map(c => c.x))),
+    y: Math.max(1e-9, Math.max(...cent.map(c => c.y)) - Math.min(...cent.map(c => c.y))),
+  };
+  const scores = cent.map(c => directionScores(c, mid, span));
+  const words = COMPASS.slice(0, cent.length);
+  let best = null;
+  const walk = (left, taken, total) => {
+    if (!left.length) { if (!best || total > best.total) best = { total, taken: taken.slice() }; return; }
+    left.forEach((w, i) => {
+      const rest = left.slice(0, i).concat(left.slice(i + 1));
+      walk(rest, taken.concat(w), total + scores[taken.length][w]);
+    });
+  };
+  walk(words, [], 0);
+  return best.taken;
+}
+
+/** storeId → zone name, recomputed from the master every time it is needed. */
+function storeZones(master) {
+  const stores = master.restaurants || {};
+  const pts = [], ids = [];
+  /* Sorted by id, not by however the master happens to be keyed: the zones a
+     technician is emailed must not depend on the order records came back in. */
+  Object.keys(stores).sort().forEach(sid => {
+    const p = storePoint(stores[sid]);
+    if (p) { pts.push(p); ids.push(sid); }
+  });
+  const out = {};
+  if (pts.length < 2) { ids.forEach(sid => { out[sid] = ""; }); return out; }
+  const k = Math.min(ZONE_K, pts.length);
+  const { assign, cent } = kmeans(pts, k);
+  const names = nameZones(cent);
+  ids.forEach((sid, i) => { out[sid] = names[assign[i]]; });
+  return out;
+}
+/* Zones read in a fixed order wherever they are listed, so two emails never
+   disagree about which one comes first. */
+const ZONE_ORDER = { North: 0, East: 1, South: 2, West: 3, "": 9 };
+const zoneLabel = z => z ? `${z} zone` : "No location on file";
+
 /** Everything dispatched to one technician by name, wherever it is. */
 function techTickets(master, techId) {
   return Object.entries(master.maintenanceTickets || {})
@@ -898,20 +1058,28 @@ function techTickets(master, techId) {
 function summaryTech(master, person, cfg) {
   const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
   const tickets = techTickets(master, person.techId);
-  const byStore = [];
-  const seen = new Map();
+  const zones = storeZones(master);
+
+  /* Zone first, store second. A technician plans the week as a set of trips,
+     and the trip is the zone — which store within it is the stop. */
+  const byZone = [];
+  const zSeen = new Map(), sSeen = new Map();
   tickets.forEach(t => {
-    let g = seen.get(t.storeId);
+    const zone = zones[t.storeId] || "";
+    let z = zSeen.get(zone);
+    if (!z) { z = { zone, label: zoneLabel(zone), stores: [], n: 0 }; zSeen.set(zone, z); byZone.push(z); }
+    const key = zone + "|" + t.storeId;
+    let g = sSeen.get(key);
     if (!g) {
       g = { sid: t.storeId, label: storeLabel((master.restaurants || {})[t.storeId] || {}), tickets: [] };
-      seen.set(t.storeId, g); byStore.push(g);
+      sSeen.set(key, g); z.stores.push(g);
     }
-    g.tickets.push(t);
+    g.tickets.push(t); z.n++;
   });
-  byStore.sort((a, b) => b.tickets.length - a.tickets.length || a.label.localeCompare(b.label));
+  byZone.sort((a, b) => (ZONE_ORDER[a.zone] ?? 9) - (ZONE_ORDER[b.zone] ?? 9));
+  byZone.forEach(z => z.stores.sort((a, b) => b.tickets.length - a.tickets.length || a.label.localeCompare(b.label)));
 
-  const rows = byStore.map(g => `<tr><td style="padding:0 24px 16px">
-      <div style="font-size:14px;font-weight:700;border-bottom:1px solid #e5e7eb;padding-bottom:5px">
+  const storeBlock = g => `<div style="font-size:14px;font-weight:700;border-bottom:1px solid #e5e7eb;padding-bottom:5px;margin-top:14px">
         <a href="${esc(storeUrlFor(app, g.sid))}" target="_blank" style="color:#111827;text-decoration:none">${esc(g.label)} <span style="color:#1d76bb;font-size:12px;font-weight:400">view store &rsaquo;</span></a>
         <span style="float:right;color:#6b7280;font-weight:400">${g.tickets.length} assigned</span></div>
       <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13.5px;line-height:1.5;margin-top:7px">${
@@ -923,17 +1091,31 @@ function summaryTech(master, person, cfg) {
               <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a>
             <div style="font-size:14px;line-height:1.5;color:#111827;margin-top:4px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
             <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, "sm", "tech")}</div></td></tr>`).join("")
-      }</table></td></tr>`).join("");
+      }</table>`;
 
-  const text = [`${tickets.length} ticket${tickets.length === 1 ? "" : "s"} assigned to you across ${byStore.length} store${byStore.length === 1 ? "" : "s"}`, "",
-    ...byStore.map(g => `${g.label} — ${g.tickets.length} assigned\n${storeUrlFor(app, g.sid)}\n` +
-      g.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp, "tech")}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp, "tech")}`).join("\n\n") + "\n")].join("\n");
+  /* With everything in one zone the heading is noise, so it is left off. */
+  const oneZone = byZone.length <= 1;
+  const rows = byZone.map(z => `<tr><td style="padding:0 24px 14px">
+      ${oneZone ? "" : `<div style="margin-top:6px;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;border-top:2px solid #111827;padding-top:9px">
+        ${esc(z.label)}<span style="float:right;font-weight:400;text-transform:none;letter-spacing:0;color:#9ca3af">${z.n} assigned · ${z.stores.length} store${z.stores.length === 1 ? "" : "s"}</span></div>`}
+      ${z.stores.map(storeBlock).join("")}
+    </td></tr>`).join("");
 
+  const text = [`${tickets.length} ticket${tickets.length === 1 ? "" : "s"} assigned to you across ${sSeen.size} store${sSeen.size === 1 ? "" : "s"}`, "",
+    ...byZone.map(z => [oneZone ? "" : `${z.label.toUpperCase()} — ${z.n} assigned, ${z.stores.length} store${z.stores.length === 1 ? "" : "s"}`,
+      ...z.stores.map(g => `${g.label} — ${g.tickets.length} assigned\n${storeUrlFor(app, g.sid)}\n` +
+        g.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp, "tech")}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp, "tech")}`).join("\n\n")),
+      ""].filter(x => x !== "").join("\n")),
+  ].join("\n");
+
+  const zoneWord = oneZone
+    ? `${sSeen.size} store${sSeen.size === 1 ? "" : "s"}`
+    : `${byZone.length} zone${byZone.length === 1 ? "" : "s"}`;
   return {
-    subject: summarySubject("tech", `${tickets.length} assigned to you across ${byStore.length} store${byStore.length === 1 ? "" : "s"}`),
+    subject: summarySubject("tech", `${tickets.length} assigned to you across ${zoneWord}`),
     html: shell(`${tickets.length} assigned to you`,
-      "Busiest store first. Either answer leaves a note on the ticket.",
-      `<tr><td style="height:10px"></td></tr>${rows}`),
+      (oneZone ? "Busiest store first." : "By zone, then store.") + " Either answer leaves a note on the ticket.",
+      `<tr><td style="height:6px"></td></tr>${rows}`),
     text,
   };
 }
@@ -1828,6 +2010,7 @@ module.exports = async (req, res) => {
   }
 };
 
+module.exports.storeZones = storeZones;
 module.exports.readMaster = readMaster;
 module.exports.recipientsFor = recipientsFor;
 module.exports.prefsFrom = prefsFrom;
