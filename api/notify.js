@@ -564,8 +564,8 @@ function shell(title, subtitle, inner, band) {
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f4f6"><tr><td align="center" style="padding:24px 12px">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#fff;border-radius:12px;overflow:hidden">
   <tr><td style="background:#1d76bb;padding:14px 24px;color:#fff;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">FixMi &nbsp;·&nbsp; ${esc(band || "Weekly summary")}</td></tr>
-  <tr><td style="padding:22px 24px 4px"><div style="font-size:20px;font-weight:700;line-height:1.3">${esc(title)}</div>
-    ${subtitle ? `<div style="font-size:14px;color:#6b7280;margin-top:5px">${esc(subtitle)}</div>` : ""}</td></tr>
+  ${title ? `<tr><td style="padding:22px 24px 4px"><div style="font-size:20px;font-weight:700;line-height:1.3">${esc(title)}</div>
+    ${subtitle ? `<div style="font-size:14px;color:#6b7280;margin-top:5px">${esc(subtitle)}</div>` : ""}</td></tr>` : ""}
   ${inner}
   <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af;line-height:1.5">
     Dossani Paradise · Repair &amp; Maintenance · sent every week from FixMi</td></tr>
@@ -1039,7 +1039,53 @@ function storeZones(master) {
 /* Zones read in a fixed order wherever they are listed, so two emails never
    disagree about which one comes first. */
 const ZONE_ORDER = { North: 0, East: 1, South: 2, West: 3, "": 9 };
-const zoneLabel = z => z ? `${z} zone` : "No location on file";
+/* A store with no coordinates on it cannot be placed. In a technician's email
+   that is not their problem to read about, so the group is simply "Other
+   stores" and it sorts last; if NOTHING can be placed the zone headings are
+   dropped altogether rather than shouting one meaningless title. */
+const zoneLabel = z => z ? `${z} zone` : "Other stores";
+
+/* ---- what a technician actually finished last week ------------------------
+   FixMi's API drops closed tickets from the normal payload — they were about
+   seven tenths of it — so a week's completed work is mostly invisible from
+   the master alone. The weekly run therefore asks for the closed set once,
+   for everybody, and hands it down. If that call fails the summaries still go
+   out; the line about last week is simply left off rather than shown wrong. */
+async function fetchClosed(masterUrl) {
+  try {
+    const url = masterUrl + (masterUrl.includes("?") ? "&" : "?") + "closed=only";
+    const r = await fetch(url, { headers: { accept: "application/json" }, cache: "no-store" });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return (j && j.maintenanceTickets) || null;
+  } catch (e) { return null; }
+}
+
+/* When the work was actually done. A status change always leaves a stamped
+   entry on the ticket's own timeline, so that is the first place to look;
+   the explicit fields are next, and the last-touched time is the fallback. */
+const DONE_STATUSES = ["finished", "closed"];
+function completedAt(t) {
+  const marks = arr(t.activity)
+    .filter(a => a && a.action === "status" && DONE_STATUSES.includes(lc(a.toStatus)) && a.ts)
+    .map(a => Number(a.ts));
+  if (marks.length) return Math.max(...marks);
+  return Number(t.finishedAt) || Number(t.closedAt) || Number(t.updatedAt) || 0;
+}
+/** Tickets this technician finished or closed in the seven days just gone. */
+function lastWeekFor(techId, pool, nowTs) {
+  const from = (nowTs || Date.now()) - 7 * 86400000;
+  const done = Object.values(pool || {}).filter(t =>
+    t && t.assignedTechId === techId && DONE_STATUSES.includes(lc(t.status)) && completedAt(t) >= from);
+  return { tickets: done.length, stores: new Set(done.map(t => t.storeId)).size };
+}
+
+/* "Gino Rossi" → "Gino". A first name is how you greet somebody. */
+const firstName = n => String(n || "").trim().split(/\s+/)[0] || "";
+function greeting() {
+  const h = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/Chicago", hour: "numeric", hour12: false }).format(new Date()));
+  return h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+}
 
 /** Everything dispatched to one technician by name, wherever it is. */
 function techTickets(master, techId) {
@@ -1055,67 +1101,106 @@ function techTickets(master, techId) {
    per site. Within a store the worst thing comes first. The two buttons only
    ever leave a comment — a technician saying "that one's done" is a report
    from the field, and moving the ticket on stays with the District Manager. */
+/* ---- the technician's week ------------------------------------------------
+   Written for a phone held in one hand in a van. A zone name big enough to
+   find by thumb, the count beside it, and then the only three things that
+   decide what gets done first: how bad it is, what is broken, and where.
+
+   No buttons: a technician tells us a job is done by finishing it in FixMi,
+   not by answering a question in an email. No category, no status, no ticket
+   age buried in a run-on line. Everything here is one tap to the ticket.
+
+   Severity colours are the validated trio used across FixMi's emails —
+   ΔE 15.6 normal vision, 9.2 deutan, all at or above 3:1 on white — and each
+   one carries its word, so nothing is told by colour alone. */
+function techPriTag(p) {
+  const k = lc(p) || "normal";
+  const c = SEV[k] ? SEV[k] : SEV.normal;
+  return `<span style="display:inline-block;background:${c.fill};color:#fff;font-size:11px;font-weight:800;
+    letter-spacing:.07em;text-transform:uppercase;border-radius:5px;padding:3px 8px;white-space:nowrap">${esc(PRIORITY_LABEL[k] || k)}</span>`;
+}
+
 function summaryTech(master, person, cfg) {
   const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
   const tickets = techTickets(master, person.techId);
   const zones = storeZones(master);
+  const stores = master.restaurants || {};
 
-  /* Zone first, store second. A technician plans the week as a set of trips,
-     and the trip is the zone — which store within it is the stop. */
   const byZone = [];
-  const zSeen = new Map(), sSeen = new Map();
+  const zSeen = new Map();
   tickets.forEach(t => {
     const zone = zones[t.storeId] || "";
     let z = zSeen.get(zone);
-    if (!z) { z = { zone, label: zoneLabel(zone), stores: [], n: 0 }; zSeen.set(zone, z); byZone.push(z); }
-    const key = zone + "|" + t.storeId;
-    let g = sSeen.get(key);
-    if (!g) {
-      g = { sid: t.storeId, label: storeLabel((master.restaurants || {})[t.storeId] || {}), tickets: [] };
-      sSeen.set(key, g); z.stores.push(g);
-    }
-    g.tickets.push(t); z.n++;
+    if (!z) { z = { zone, label: zoneLabel(zone), tickets: [], stores: new Set(), counts: zeroCounts() }; zSeen.set(zone, z); byZone.push(z); }
+    z.tickets.push(t); z.stores.add(t.storeId);
+    const k = lc(t.priority); z.counts[SEV[k] ? k : "normal"]++;
   });
   byZone.sort((a, b) => (ZONE_ORDER[a.zone] ?? 9) - (ZONE_ORDER[b.zone] ?? 9));
-  byZone.forEach(z => z.stores.sort((a, b) => b.tickets.length - a.tickets.length || a.label.localeCompare(b.label)));
+  const placed = byZone.some(z => z.zone);
 
-  const storeBlock = g => `<div style="font-size:14px;font-weight:700;border-bottom:1px solid #e5e7eb;padding-bottom:5px;margin-top:14px">
-        <a href="${esc(storeUrlFor(app, g.sid))}" target="_blank" style="color:#111827;text-decoration:none">${esc(g.label)} <span style="color:#1d76bb;font-size:12px;font-weight:400">view store &rsaquo;</span></a>
-        <span style="float:right;color:#6b7280;font-weight:400">${g.tickets.length} assigned</span></div>
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13.5px;line-height:1.5;margin-top:7px">${
-        g.tickets.map(t => `<tr>
-          <td style="padding:8px 8px 14px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
-          <td style="padding:8px 0 14px;vertical-align:top">
-            <a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="color:#111827;text-decoration:none">
-              <b style="color:#1d76bb">${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
-              <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a>
-            <div style="font-size:14px;line-height:1.5;color:#111827;margin-top:4px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
-            <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, "sm", "tech")}</div></td></tr>`).join("")
-      }</table>`;
+  const line = t => {
+    const st = stores[t.storeId] || {};
+    return `<tr><td style="padding:0 0 4px">
+      <a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="display:block;text-decoration:none;color:#111827;
+         border:1px solid #e5e7eb;border-left:5px solid ${(SEV[lc(t.priority)] || SEV.normal).fill};border-radius:10px;padding:13px 14px">
+        ${techPriTag(t.priority)}
+        <div style="font-size:17px;line-height:1.35;font-weight:600;margin-top:9px">${esc(t.description || "No description")}</div>
+        <div style="font-size:13px;color:#6b7280;margin-top:6px">${esc(storeLabel(st))} &nbsp;·&nbsp; ${esc(ageOf(t.createdAt))}</div>
+      </a></td></tr>`;
+  };
 
-  /* With everything in one zone the heading is noise, so it is left off. */
-  const oneZone = byZone.length <= 1;
-  const rows = byZone.map(z => `<tr><td style="padding:0 24px 14px">
-      ${oneZone ? "" : `<div style="margin-top:6px;font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;border-top:2px solid #111827;padding-top:9px">
-        ${esc(z.label)}<span style="float:right;font-weight:400;text-transform:none;letter-spacing:0;color:#9ca3af">${z.n} assigned · ${z.stores.length} store${z.stores.length === 1 ? "" : "s"}</span></div>`}
-      ${z.stores.map(storeBlock).join("")}
-    </td></tr>`).join("");
+  /* Only the HEADING is conditional. With no coordinates anywhere there is no
+     zone to announce, but the tickets themselves still have to be listed. */
+  const zoneHead = z => `<tr><td style="padding:22px 20px 0">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:3px solid #111827">
+        <tr>
+          <td style="padding:12px 0 2px;vertical-align:bottom">
+            <div style="font-size:27px;line-height:1.1;font-weight:800;letter-spacing:-.01em">${esc(z.label)}</div>
+            <div style="font-size:13px;color:#6b7280;margin-top:5px">${
+              SEV_ORDER.filter(k => z.counts[k]).map(k => `${z.counts[k]} ${SEV[k].label}`).join(" · ")
+            } &nbsp;·&nbsp; ${z.stores.size} store${z.stores.size === 1 ? "" : "s"}</div>
+          </td>
+          <td style="padding:12px 0 2px;text-align:right;vertical-align:bottom;white-space:nowrap">
+            <span style="font-size:46px;line-height:1;font-weight:800">${z.tickets.length}</span>
+          </td>
+        </tr>
+      </table></td></tr>`;
+  const zoneBlock = z => (placed ? zoneHead(z) : "") +
+    `<tr><td style="padding:${placed ? 14 : 18}px 20px 0"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${
+      z.tickets.map(line).join("")}</table></td></tr>`;
 
-  const text = [`${tickets.length} ticket${tickets.length === 1 ? "" : "s"} assigned to you across ${sSeen.size} store${sSeen.size === 1 ? "" : "s"}`, "",
-    ...byZone.map(z => [oneZone ? "" : `${z.label.toUpperCase()} — ${z.n} assigned, ${z.stores.length} store${z.stores.length === 1 ? "" : "s"}`,
-      ...z.stores.map(g => `${g.label} — ${g.tickets.length} assigned\n${storeUrlFor(app, g.sid)}\n` +
-        g.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp, "tech")}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp, "tech")}`).join("\n\n")),
-      ""].filter(x => x !== "").join("\n")),
-  ].join("\n");
+  const lw = person.lastWeek;
+  const hello = `${greeting()}${firstName(person.name) ? " " + esc(firstName(person.name)) : ""}.`;
+  const recap = lw
+    ? (lw.tickets
+        ? `Last week you closed ${lw.tickets} ticket${lw.tickets === 1 ? "" : "s"} across ${lw.stores} store${lw.stores === 1 ? "" : "s"}.`
+        : "Nothing came through as closed last week.")
+    : "";
 
-  const zoneWord = oneZone
-    ? `${sSeen.size} store${sSeen.size === 1 ? "" : "s"}`
-    : `${byZone.length} zone${byZone.length === 1 ? "" : "s"}`;
+  const head = `<tr><td style="padding:24px 20px 0">
+      <div style="font-size:22px;font-weight:700;line-height:1.3">${hello}</div>
+      ${recap ? `<div style="font-size:16px;color:#374151;line-height:1.45;margin-top:7px">${esc(recap)}</div>` : ""}
+      <div style="font-size:16px;color:#374151;line-height:1.45;margin-top:${recap ? 14 : 7}px">${
+        tickets.length
+          ? `Here&rsquo;s a preview of this week:`
+          : `Nothing is assigned to you this week.`}</div></td></tr>`;
+
+  const text = [
+    `${greeting()}${firstName(person.name) ? " " + firstName(person.name) : ""}.`,
+    recap, "",
+    tickets.length ? "Here's a preview of this week:" : "Nothing is assigned to you this week.", "",
+    ...byZone.map(z => [
+      ...(placed ? [z.label.toUpperCase() + `  —  ${z.tickets.length}`,
+        SEV_ORDER.filter(k => z.counts[k]).map(k => `${z.counts[k]} ${SEV[k].label}`).join(" · ") +
+          ` · ${z.stores.size} store${z.stores.size === 1 ? "" : "s"}`, ""] : []),
+      ...z.tickets.map(t => `  [${(PRIORITY_LABEL[lc(t.priority)] || "Normal").toUpperCase()}] ${t.description || "No description"}\n  ${storeLabel(stores[t.storeId] || {})} · ${ageOf(t.createdAt)}\n  ${ticketUrlFor(app, t)}`),
+      "",
+    ].join("\n")),
+  ].filter(x => x !== "").join("\n");
+
   return {
-    subject: summarySubject("tech", `${tickets.length} assigned to you across ${zoneWord}`),
-    html: shell(`${tickets.length} assigned to you`,
-      (oneZone ? "Busiest store first." : "By zone, then store.") + " Either answer leaves a note on the ticket.",
-      `<tr><td style="height:6px"></td></tr>${rows}`),
+    subject: summarySubject("tech", `${tickets.length} assigned to you${placed && byZone.length > 1 ? ` across ${byZone.length} zones` : ""}`),
+    html: shell("", "", head + byZone.map(zoneBlock).join("") + `<tr><td style="height:22px"></td></tr>`),
     text,
   };
 }
@@ -1428,7 +1513,7 @@ function reminderBody(rule, store, ticket, cfg) {
 
 /* Everyone who should get a summary, and what each of them should see. Roles
    come from FindMi at send time, so a new GM is included the week they start. */
-function summaryAudience(master, kind, prefs) {
+function summaryAudience(master, kind, prefs, donePool) {
   const stores = master.restaurants || {};
   const people = (prefs && prefs.people) || {};
   const optedOut = e => ((people[lc(e)] || {}).weekly === false);
@@ -1461,7 +1546,8 @@ function summaryAudience(master, kind, prefs) {
       if (!lc(t.email).includes("@") || optedOut(t.email)) return;
       const tickets = Object.entries(master.maintenanceTickets || {})
         .filter(([, tk]) => tk && tk.assignedTechId === id && OPEN_STATUSES.includes(tk.status));
-      if (tickets.length) out.push({ kind, email: lc(t.email), name: t.name || t.email, techId: id });
+      if (tickets.length) out.push({ kind, email: lc(t.email), name: t.name || t.email, techId: id,
+        lastWeek: donePool ? lastWeekFor(id, donePool) : null });
     });
   } else if (kind === "do") {
     Object.entries(master.directors || {}).forEach(([id, d]) => {
@@ -1484,10 +1570,10 @@ function buildSummary(master, person, cfg) {
 /* A stand-in used by the "send me a test" buttons, so a summary can be seen
    even by someone who isn't a GM anywhere. Picks the busiest real store /
    patch, so the test looks like the real thing rather than an empty shell. */
-function sampleAudience(master, kind, email, prefs) {
+function sampleAudience(master, kind, email, prefs, donePool) {
   // VP and Overwatch are company-wide, so anyone can preview them as themselves.
   if (kind === "vp" || kind === "ow") return { kind, email: lc(email), name: email, storeIds: Object.keys(master.restaurants || {}) };
-  const real = summaryAudience(master, kind, prefs);
+  const real = summaryAudience(master, kind, prefs, donePool);
   const mine = real.find(p => p.email === lc(email));
   if (mine) return { ...mine, email: lc(email) };
   const busiest = real.map(p => ({
@@ -1663,6 +1749,14 @@ module.exports = async (req, res) => {
       const prefs0 = prefsFrom(master);
       const mode = body.mode || "preview";
       const kind = SUMMARY_KINDS.includes(body.kind) ? body.kind : "gm";
+      /* Only the technician summary looks back at last week, and only it needs
+         the closed set — so the extra call is made only when one is in play. */
+      const wantsTech = mode === "run"
+        ? (arr(body.kinds).length ? arr(body.kinds) : ["gm", "dm", "do", "vp"]).includes("tech")
+        : kind === "tech";
+      const donePool = wantsTech
+        ? { ...(master.maintenanceTickets || {}), ...(await fetchClosed(cfg.masterUrl) || {}) }
+        : null;
       const sCfg = {
         appUrl: cfg.appUrl,
         selfUrl: (process.env.FIXMI_SELF_URL || `https://${req.headers.host || ""}`).replace(/\/$/, ""),
@@ -1670,7 +1764,7 @@ module.exports = async (req, res) => {
       };
 
       if (mode === "preview" || mode === "test") {
-        const who = sampleAudience(master, kind, body.to || (arr(body.to)[0]) || "preview@example.com", prefs0);
+        const who = sampleAudience(master, kind, body.to || (arr(body.to)[0]) || "preview@example.com", prefs0, donePool);
         if (!who) return res.status(200).json({ ok: false, reason: kind === "vp"
           ? "add at least one address to the VP list in Settings → Email"
           : `there are no ${kind.toUpperCase()}s with an email address in FindMi yet` });
@@ -1695,7 +1789,7 @@ module.exports = async (req, res) => {
          preference. Test mode still applies, so this can't surprise anyone. */
       if (mode === "one") {
         const to = lc(body.to);
-        const list = summaryAudience(master, kind, {});     // {} = ignore opt-outs
+        const list = summaryAudience(master, kind, {}, donePool);   // {} = ignore opt-outs
         let who = list.find(p => p.email === to);
         if (!who && (kind === "vp" || kind === "ow")) who = { kind, email: to, name: to, storeIds: Object.keys(master.restaurants || {}) };
         if (!who) return res.status(200).json({ ok: false, reason: `${to || "that address"} isn't a ${kind.toUpperCase()} FixMi knows about` });
@@ -1719,7 +1813,7 @@ module.exports = async (req, res) => {
       const kinds = arr(body.kinds).length ? arr(body.kinds).filter(k => SUMMARY_KINDS.includes(k)) : ["gm", "dm", "do", "vp"];
       const messages = [], log = [], manifest = [];
       kinds.forEach(k => {
-        summaryAudience(master, k, prefs0).forEach(person => {
+        summaryAudience(master, k, prefs0, donePool).forEach(person => {
           const built = buildSummary(master, person, sCfg);
           manifest.push({ kind: k, name: person.name, email: person.email, subject: built.subject });
           // Test mode: everything goes to the test addresses instead, and says
