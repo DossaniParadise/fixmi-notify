@@ -616,21 +616,25 @@ function summaryDM(master, person, cfg) {
       ${b.tickets.length
         ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13.5px;line-height:1.5;margin-top:7px">${
             b.tickets.map(t => `<tr>
-              <td style="padding:6px 8px 10px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
-              <td style="padding:6px 0 10px;vertical-align:top"><a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="color:#111827;text-decoration:none">
-                <b style="color:#1d76bb">${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
-                <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a>
-                <div style="margin-top:6px">${answerButtons(cfg, t._id, person.email, "sm")}</div></td></tr>`).join("")
+              <td style="padding:8px 8px 14px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
+              <td style="padding:8px 0 14px;vertical-align:top">
+                <a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="color:#111827;text-decoration:none">
+                  <b style="color:#1d76bb">${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
+                  <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a>
+                <!-- Without the issue itself a DM is being asked to mark
+                     something resolved on the strength of its category. -->
+                <div style="font-size:14px;line-height:1.5;color:#111827;margin-top:4px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
+                <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, "sm")}</div></td></tr>`).join("")
           }</table>`
         : `<div style="font-size:13.5px;color:#059669;margin-top:6px">Nothing open.</div>`}
     </td></tr>`).join("");
   const text = [`${total} open across ${blocks.length} store${blocks.length === 1 ? "" : "s"}`, "",
     ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n${storeUrlFor(app, b.sid)}\n` +
-      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp)}`).join("\n") : "  Nothing open.") + "\n")].join("\n");
+      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp)}`).join("\n\n") : "  Nothing open.") + "\n")].join("\n");
   return {
     subject: summarySubject("dm", `${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`),
     html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
-      "Busiest store first.",
+      "Busiest store first. Resolved moves a ticket to Finished; Unresolved just notes it.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
