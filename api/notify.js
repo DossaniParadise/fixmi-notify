@@ -441,15 +441,36 @@ function openTicketsFor(master, storeId) {
    and clicked from a phone with no login. They are signed with the shared
    secret so the ticket id and the answer can't be edited into something else,
    and they carry who was asked, so the comment is attributed properly. */
-function answerSig(ticketId, answer, email, when) {
+/* The alignment master sits behind a CDN that will happily serve a copy up to
+   a minute old. Anywhere we read a ticket, change it and write the whole thing
+   back, that copy is a hazard: two people answering the same ticket a few
+   seconds apart would each read the world as it was before the other, and the
+   second write would erase the first one's comment. A unique query string is a
+   different object as far as the CDN is concerned, so this always reaches the
+   origin — and if the API ever objects to the extra parameter, the plain read
+   still runs. */
+async function readMaster(url) {
+  const opts = { headers: { accept: "application/json", "cache-control": "no-cache" }, cache: "no-store" };
+  const bust = url + (url.includes("?") ? "&" : "?") + "_fresh=" + Date.now().toString(36);
+  const r = await fetch(bust, opts).catch(() => null);
+  return (r && r.ok) ? r : fetch(url, opts);
+}
+
+function answerSig(ticketId, answer, email, when, role) {
   return require("crypto").createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
-    .update(`${ticketId}|${answer}|${lc(email)}|${when || ""}`).digest("hex").slice(0, 32);
+    .update(`${ticketId}|${answer}|${lc(email)}|${when || ""}${role ? "|" + lc(role) : ""}`).digest("hex").slice(0, 32);
 }
 /* `when` is the day this summary went out. It is signed in so that each week's
    buttons are their own links — otherwise a manager who answered last week
    would be told "already noted" every week after. */
-function answerUrl(base, ticketId, answer, email, when) {
-  const q = new URLSearchParams({ t: ticketId, a: answer, e: lc(email), w: when || "", s: answerSig(ticketId, answer, email, when) });
+/* `role` is what the press is allowed to do. A General Manager's press only
+   ever writes a comment; a District Manager's "Resolved" also moves the ticket
+   to Finished. It is signed along with everything else, so the two cannot be
+   swapped by editing the address bar, and a link with no role at all — one
+   sent before this existed — is treated as the GM case, which changes nothing. */
+function answerUrl(base, ticketId, answer, email, when, role) {
+  const q = new URLSearchParams({ t: ticketId, a: answer, e: lc(email), w: when || "", r: lc(role || "gm"),
+    s: answerSig(ticketId, answer, email, when, role || "gm") });
   return `${base.replace(/\/$/, "")}/api/answer?${q}`;
 }
 function todayStamp() {
@@ -459,12 +480,12 @@ function todayStamp() {
 }
 
 /** The pair of buttons that turn a summary line into a one-tap answer. */
-function answerButtons(cfg, ticketId, email, size) {
+function answerButtons(cfg, ticketId, email, size, role) {
   const w = cfg.stamp || todayStamp();
   const pad = size === "sm" ? "7px 15px" : "9px 22px";
   const fs = size === "sm" ? "13px" : "14px";
-  return `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "unresolved", email, w))}" target="_blank" style="display:inline-block;background:#c81e1e;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 8px 6px 0">Unresolved</a>` +
-    `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "resolved", email, w))}" target="_blank" style="display:inline-block;background:#047857;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 0 6px 0">Resolved</a>`;
+  return `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "unresolved", email, w, role))}" target="_blank" style="display:inline-block;background:#c81e1e;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 8px 6px 0">Unresolved</a>` +
+    `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "resolved", email, w, role))}" target="_blank" style="display:inline-block;background:#047857;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 0 6px 0">Resolved</a>`;
 }
 
 function ticketUrlFor(appUrl, t) {
@@ -573,7 +594,7 @@ function summaryGM(master, person, cfg) {
           <div style="font-size:15px;line-height:1.5;margin-top:6px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
           <div style="font-size:12.5px;color:#6b7280;margin-top:7px">Opened ${esc(fmtDay(t.createdAt))} by ${esc(t.createdByName || t.createdBy || "someone")}${t.assigneeLabel ? ` · assigned to ${esc(t.assigneeLabel)}` : ""}</div>
           <div style="margin-top:13px;font-size:13px;color:#6b7280">Still a problem?</div>
-          <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email)}</div>
+          <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, null, "gm")}</div>
           <div style="margin-top:9px;font-size:12px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" target="_blank" style="color:#1d76bb">Open it in FixMi</a></div>
         </td></tr>
       </table></td></tr>`;
@@ -583,15 +604,15 @@ function summaryGM(master, person, cfg) {
     ...tickets.map(t => [
       `${t.shortId} · ${PRIORITY_LABEL[lc(t.priority)] || "Normal"} · ${STATUS_LABEL[t.status] || t.status} · open ${ageOf(t.createdAt)}`,
       t.description || "No description",
-      `UNRESOLVED: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}`,
-      `                  RESOLVED:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp)}`,
+      `UNRESOLVED: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp, "gm")}`,
+      `                  RESOLVED:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp, "gm")}`,
       "",
     ].join("\n")),
   ].join("\n");
   return {
     subject: summarySubject("gm", `${label}: ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`),
     html: shell(`${tickets.length} open at ${label}`,
-      "Resolved moves a ticket to Finished. Unresolved just notes it.",
+      "Either answer leaves a note on the ticket.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
@@ -624,17 +645,17 @@ function summaryDM(master, person, cfg) {
                 <!-- Without the issue itself a DM is being asked to mark
                      something resolved on the strength of its category. -->
                 <div style="font-size:14px;line-height:1.5;color:#111827;margin-top:4px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
-                <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, "sm")}</div></td></tr>`).join("")
+                <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, "sm", "dm")}</div></td></tr>`).join("")
           }</table>`
         : `<div style="font-size:13.5px;color:#059669;margin-top:6px">Nothing open.</div>`}
     </td></tr>`).join("");
   const text = [`${total} open across ${blocks.length} store${blocks.length === 1 ? "" : "s"}`, "",
     ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n${storeUrlFor(app, b.sid)}\n` +
-      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp)}`).join("\n\n") : "  Nothing open.") + "\n")].join("\n");
+      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp, "dm")}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp, "dm")}`).join("\n\n") : "  Nothing open.") + "\n")].join("\n");
   return {
     subject: summarySubject("dm", `${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`),
     html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
-      "Busiest store first. Resolved moves a ticket to Finished; Unresolved just notes it.",
+      "Busiest store first. Resolved moves a ticket to Finished; Unresolved notes it.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
@@ -1180,7 +1201,7 @@ module.exports = async (req, res) => {
     if (body._master && typeof body._master === "object") {
       master = body._master;
     } else {
-      const r = await fetch(cfg.masterUrl, { headers: { accept: "application/json" } });
+      const r = await readMaster(cfg.masterUrl);
       if (!r.ok) return res.status(502).json({ error: `could not read the alignment master (HTTP ${r.status})` });
       master = await r.json();
     }
