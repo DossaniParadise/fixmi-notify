@@ -71,6 +71,16 @@ const PREF_DEFAULTS = {
   testMode: false, testTo: [], alwaysTo: [],
   /* The VP summary has no role behind it — it goes to a named list. */
   vpTo: [],
+  /* Nudges for tickets that are waiting on the store rather than on a tech.
+     This one ships switched on so the feature works the moment both files are
+     deployed, rather than waiting for somebody to open Settings and press
+     Save. Saving an empty list here deletes it, as you would expect. */
+  reminders: [{
+    id: "headset-return", on: true, name: "Headset exchange return",
+    match: ["headset exchange", "headsets to be replaced", "headset return", "return has been shipped"],
+    days: 7, repeatDays: 7, to: ["gm", "dm"],
+    message: "Reminder to keep an eye out for your headset exchange, be sure to send the old ones back to avoid being charged.",
+  }],
   /* Which priorities each role/event pair actually wants. Absent means all
      three, so every record saved before this existed keeps behaving the same. */
   pri: {},
@@ -104,6 +114,7 @@ function prefsFrom(master) {
         });
       });
     }
+    if (raw.reminders !== undefined) p.reminders = arr(raw.reminders);
     if (raw.people && typeof raw.people === "object") {
       /* Written as a list, because the database refuses a key with a dot in it
          and every one of these is keyed by an email address. An older record
@@ -210,28 +221,60 @@ function subjectFor(store, ticket) {
 
 /* Say what actually happened in words, not a status-code diff. "Moved from
    Finished to Closed" tells a District Manager far less than "closed". */
+/* A status email's whole job is "what changed, and does that need anything
+   from me". The old one buried the change as one row in a table of nine and
+   left the reader to work out what "Waiting" meant for them. These three
+   pieces — the plain-English headline, the from → to band, and a line saying
+   what happens next — replace that guesswork. */
+const STATUS_TONE = {
+  unassigned:  "#4b5563",
+  assigned:    "#1d76bb",
+  dispatched:  "#1d76bb",
+  in_progress: "#1d76bb",
+  waiting:     "#c2740a",
+  finished:    "#047857",
+  closed:      "#047857",
+};
+/** Drop the decoration so a name reads as a name inside a sentence. */
+function plainAssignee(a) {
+  return String(a || "").replace(/^[^\w(]+/, "").replace(/\s*\((in-house|third-party)\)\s*$/i, "").trim();
+}
+/** What happens next, in the reader's terms. */
+function nextStepFor(status, ticket, who) {
+  switch (status) {
+    case "unassigned":  return "Nobody is on it yet — it needs assigning before anything else happens.";
+    case "assigned":    return who ? `${who} has it and will arrange a visit. Nothing needed from the store yet.`
+                                   : "Nothing needed from the store yet.";
+    case "dispatched":  return who ? `${who} is on the way. Nothing needed from the store until they arrive.`
+                                   : "Someone is on the way.";
+    case "in_progress": return "Work is happening now. You'll get another email when it's done.";
+    case "waiting":     return "Nobody is working on it until that clears. It stays open and will keep appearing on the weekly summary.";
+    case "finished":    return "The work is done. It stays open until someone reviews it and closes it off in FixMi.";
+    case "closed":      return "Nothing further — this one is done and closed.";
+    default: return "";
+  }
+}
 function headlineFor(event, store, ticket, prevStatus, comment, extra) {
   const who = storeLabel(store);
   if (event === "created") return `${who} has a new ticket open.`;
   if (event === "comment") return `${who} — new comment from ${(comment && comment.by) || "someone"}.`;
 
   const assignee = (extra && extra.assignee) || ticket.assigneeLabel || "";
+  const name = plainAssignee(assignee);
   // Who it's on beats which column it sits in — lead with that when it changed.
   if (extra && extra.assigneeChanged) {
-    return assignee
-      ? `${who} — ticket assigned to ${assignee}.`
-      : `${who} — ticket put back in the unassigned pool.`;
+    return name ? `${who} — now with ${name}.` : `${who} — back in the queue, nobody assigned.`;
   }
   switch (ticket.status) {
-    case "closed":      return `${who} — ticket closed.`;
-    case "finished":    return `${who} — work finished.`;
-    case "in_progress": return `${who} — work started.`;
-    // The reasons are already phrased as "Awaiting parts" — lowercasing them
-    // into "waiting on awaiting parts" reads like a stutter.
-    case "waiting":     return `${who} — on hold${ticket.waitingReason ? " — " + ticket.waitingReason : ""}.`;
-    case "unassigned":  return `${who} — ticket put back in the unassigned pool.`;
-    case "assigned":
-    case "dispatched":  return assignee ? `${who} — ticket is with ${assignee}.` : `${who} — ticket dispatched.`;
+    case "closed":      return `${who} — this ticket is closed.`;
+    case "finished":    return `${who} — the work is done.`;
+    case "in_progress": return name ? `${who} — ${name} has started work.` : `${who} — work has started.`;
+    // The reason is already phrased as "Awaiting parts", so "waiting on
+    // awaiting parts" would stutter.
+    case "waiting":     return `${who} — paused${ticket.waitingReason ? ", " + String(ticket.waitingReason).charAt(0).toLowerCase() + String(ticket.waitingReason).slice(1) : ""}.`;
+    case "unassigned":  return `${who} — back in the queue, nobody assigned.`;
+    case "assigned":    return name ? `${who} — assigned to ${name}.` : `${who} — assigned.`;
+    case "dispatched":  return name ? `${who} — ${name} is on the way.` : `${who} — a technician is on the way.`;
   }
   const to = STATUS_LABEL[ticket.status] || ticket.status || "updated";
   const from = STATUS_LABEL[prevStatus] || prevStatus;
@@ -250,6 +293,11 @@ function fmtDay(ts) {
   const n = Number(ts);
   if (!n) return "";
   return new Date(n).toLocaleString("en-US", { timeZone: "America/Chicago", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+}
+/** "3 days ago", but "today" on its own — "today ago" is not a thing. */
+function agePhrase(ts) {
+  const a = ageOf(ts);
+  return !a ? "" : (a === "today" ? "today" : `${a} ago`);
 }
 /** "3 days" — how long a ticket has been sitting there. */
 function ageOf(ts) {
@@ -278,7 +326,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
       <div style="border:1px solid ${isNew ? "#1d76bb" : "#e5e7eb"};background:${isNew ? "#eff6ff" : "#fff"};border-radius:9px;padding:10px 13px">
         <div style="font-size:12px;color:#6b7280"><b style="color:#111827">${i + 1}. ${esc(c.by || "Someone")}</b>${c.email ? ` &lt;${esc(c.email)}&gt;` : ""} · ${esc(fmtWhen(c.ts))}${isNew ? ` <span style="color:#1d76bb;font-weight:700">· newest</span>` : ""}</div>
         ${c.text ? `<div style="font-size:14.5px;line-height:1.5;white-space:pre-wrap;margin-top:4px">${esc(c.text)}</div>` : ""}
-        ${ph.length ? `<div style="margin-top:8px">${ph.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="120" alt="" style="width:120px;border-radius:6px;border:1px solid #e5e7eb;display:inline-block;margin:0 6px 6px 0"></a>`).join("")}</div>` : ""}
+        ${ph.length ? `<div style="margin-top:8px">${ph.map(u => `<a href="${esc(u)}" target="_blank"><img src="${esc(u)}" width="120" alt="" style="width:120px;border-radius:6px;border:1px solid #e5e7eb;display:inline-block;margin:0 6px 6px 0"></a>`).join("")}</div>` : ""}
       </div></td></tr>`;
   }).join("");
   // The new comment, big, directly under the headline — no scrolling for it.
@@ -286,18 +334,41 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     <div style="border-left:4px solid #1d76bb;background:#eff6ff;border-radius:0 9px 9px 0;padding:12px 16px">
       <div style="font-size:12px;font-weight:700;color:#1d76bb;text-transform:uppercase;letter-spacing:.06em">New comment · ${esc(comment.by || "")}${comment.ts ? " · " + esc(fmtWhen(comment.ts)) : ""}</div>
       ${comment.text ? `<div style="font-size:16px;line-height:1.55;white-space:pre-wrap;margin-top:6px">${esc(comment.text)}</div>` : ""}
-      ${cPhotos.length ? `<div style="margin-top:10px">${cPhotos.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="160" alt="Comment photo" style="width:160px;max-width:100%;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</div>` : ""}
+      ${cPhotos.length ? `<div style="margin-top:10px">${cPhotos.map(u => `<a href="${esc(u)}" target="_blank"><img src="${esc(u)}" width="160" alt="Comment photo" style="width:160px;max-width:100%;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</div>` : ""}
     </div></td></tr>` : "";
+  /* The change itself, shown as a change. Only on status emails — on a new
+     ticket or a comment there is no "from". */
+  const isStatus = event === "status";
+  const moved = isStatus && prevStatus && prevStatus !== ticket.status;
+  const tone = STATUS_TONE[ticket.status] || "#1d76bb";
+  const chip = (label, colour, strong) =>
+    `<span style="display:inline-block;border:1px solid ${strong ? colour : "#d1d5db"};${strong ? `background:${colour};color:#fff;` : "color:#6b7280;"}font-size:13px;font-weight:${strong ? 700 : 400};border-radius:7px;padding:4px 11px;white-space:nowrap">${esc(label)}</span>`;
+  const changeBand = isStatus ? `<tr><td style="padding:14px 24px 0">
+    <table role="presentation" cellspacing="0" cellpadding="0"><tr>
+      ${moved ? `<td style="padding-right:9px">${chip(STATUS_LABEL[prevStatus] || prevStatus, "", false)}</td>
+                 <td style="padding-right:9px;color:#9ca3af;font-size:17px">&rarr;</td>` : ""}
+      <td>${chip(STATUS_LABEL[ticket.status] || ticket.status, tone, true)}</td>
+    </tr></table>
+    <div style="font-size:12.5px;color:#6b7280;margin-top:8px">Changed by ${esc(actorName || "someone")} · ${esc(fmtWhen(Date.now()))}</div>
+  </td></tr>` : "";
+  const nextStep = isStatus ? nextStepFor(ticket.status, ticket, plainAssignee(assignee)) : "";
+  const nextBlock = nextStep ? `<tr><td style="padding:14px 24px 0">
+    <div style="background:#f9fafb;border-left:4px solid ${tone};border-radius:0 9px 9px 0;padding:11px 14px;font-size:14.5px;line-height:1.5">
+      <b style="font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:#6b7280;display:block;margin-bottom:3px">What happens next</b>
+      ${esc(nextStep)}</div></td></tr>` : "";
+
   const facts = [
     ["Store", storeLabel(store)],
-    ["Status", STATUS_LABEL[ticket.status] || ticket.status],
+    // On a status email the status is the headline, the band and the next-step
+    // box — a ninth row repeating it is what made these hard to read.
+    isStatus ? null : ["Status", STATUS_LABEL[ticket.status] || ticket.status],
     ["Priority", ticket.priority ? (PRIORITY_LABEL[ticket.priority] || ticket.priority) : "Normal"],
     ["Category", ticket.categoryLabel || [ticket.category, ticket.subcategory].filter(Boolean).join(" › ")],
     ["Assigned to", assignee],
-    ticket.status === "waiting" ? ["Waiting on", ticket.waitingReason] : null,
+    (ticket.status === "waiting" && !isStatus) ? ["Waiting on", ticket.waitingReason] : null,
     ["Reported by", ticket.createdByName || ticket.createdBy],
-    ["Opened", ticket.createdAt ? `${fmtDay(ticket.createdAt)}  (${ageOf(ticket.createdAt)} ago)` : ""],
-    event === "created" ? null : [event === "comment" ? "Comment by" : "Changed by", (comment && comment.by) || actorName],
+    ["Opened", ticket.createdAt ? `${fmtDay(ticket.createdAt)}  (${agePhrase(ticket.createdAt)})` : ""],
+    (event === "created" || isStatus) ? null : ["Comment by", (comment && comment.by) || actorName],
   ].filter(Boolean).filter(([, v]) => String(v == null ? "" : v).trim() !== "");   // a blank row is noise, not "—"
 
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -308,7 +379,9 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
   ${wouldHaveGoneTo ? `<tr><td style="background:#fffbeb;border-bottom:1px solid #fde68a;padding:11px 24px;font-size:12.5px;color:#92400e">
     <b>Test mode.</b> Nobody else received this. Live, it would have gone to: ${esc(wouldHaveGoneTo.join(", ") || "nobody")}.</td></tr>` : ""}
   <tr><td style="padding:24px 24px 6px"><div style="font-size:19px;font-weight:700;line-height:1.35">${esc(headline)}</div>
-    <div style="font-size:14px;color:#6b7280;margin-top:6px">See details below.</div></td></tr>
+    ${isStatus ? "" : `<div style="font-size:14px;color:#6b7280;margin-top:6px">See details below.</div>`}</td></tr>
+  ${changeBand}
+  ${nextBlock}
   ${newCommentBlock}
   <tr><td style="padding:14px 24px 0"><table role="presentation" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7">
     ${facts.map(([k, v]) => `<tr><td style="color:#6b7280;padding-right:16px;white-space:nowrap">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
@@ -316,7 +389,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
   <tr><td style="padding:18px 24px 0">
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Issue${ticket.createdAt ? ` <span style="font-weight:400;text-transform:none;letter-spacing:0">· ${esc(ticket.createdByName || ticket.createdBy || "")} · ${esc(fmtDay(ticket.createdAt))}</span>` : ""}</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px">${esc(ticket.description || "No description")}</div></td></tr>
-  ${photos.length ? `<tr><td style="padding:14px 24px 0">${photos.map(u => `<a href="${esc(u)}"><img src="${esc(u)}" width="160" alt="Ticket photo" style="width:160px;max-width:100%;height:auto;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</td></tr>` : ""}
+  ${photos.length ? `<tr><td style="padding:14px 24px 0">${photos.map(u => `<a href="${esc(u)}" target="_blank"><img src="${esc(u)}" width="160" alt="Ticket photo" style="width:160px;max-width:100%;height:auto;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</td></tr>` : ""}
   ${closeNote ? `<tr><td style="padding:18px 24px 0">
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Closing notes · ${esc(closeNote.by || "")}</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 14px">${esc(closeNote.text)}</div>
@@ -327,7 +400,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
   </td></tr>` : ""}
   ${canReply ? `<tr><td style="padding:18px 24px 0"><div style="font-size:13px;color:#6b7280;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:11px 14px">
     <b style="color:#111827">You can just reply to this email.</b> Your reply is added to the ticket as a comment and everyone else on it is notified.</div></td></tr>` : ""}
-  <tr><td style="padding:24px"><a href="${esc(url)}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px">See more on FixMi →</a></td></tr>
+  <tr><td style="padding:24px"><a href="${esc(url)}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px" target="_blank">See more on FixMi →</a></td></tr>
   <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af">Dossani Paradise · Repair &amp; Maintenance · Ticket ${esc(ticket.shortId || "")}</td></tr>
 </table></td></tr></table></body></html>`;
 
@@ -335,6 +408,13 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     ...(comment ? [`NEW COMMENT · ${comment.by || ""}${comment.ts ? " · " + fmtWhen(comment.ts) : ""}`, comment.text || "", ...cPhotos, ""] : []),
     ...(wouldHaveGoneTo ? [`TEST MODE — nobody else received this. Live, it would have gone to: ${wouldHaveGoneTo.join(", ") || "nobody"}.`, ""] : []),
     headline, "",
+    ...(isStatus ? [
+      moved ? `${STATUS_LABEL[prevStatus] || prevStatus}  →  ${STATUS_LABEL[ticket.status] || ticket.status}`
+            : `Now: ${STATUS_LABEL[ticket.status] || ticket.status}`,
+      `Changed by ${actorName || "someone"} · ${fmtWhen(Date.now())}`,
+      ...(nextStep ? ["", "WHAT HAPPENS NEXT", nextStep] : []),
+      "",
+    ] : []),
     ...facts.map(([k, v]) => `${k}: ${v}`),
     "", "ISSUE", ticket.description || "No description",
     ...(photos.length ? ["", "PHOTOS", ...photos] : []),
@@ -398,8 +478,8 @@ function answerButtons(cfg, ticketId, email, size) {
   const w = cfg.stamp || todayStamp();
   const pad = size === "sm" ? "7px 15px" : "9px 22px";
   const fs = size === "sm" ? "13px" : "14px";
-  return `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "unresolved", email, w))}" style="display:inline-block;background:#c81e1e;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 8px 6px 0">Unresolved</a>` +
-    `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "resolved", email, w))}" style="display:inline-block;background:#047857;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 0 6px 0">Resolved</a>`;
+  return `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "unresolved", email, w))}" target="_blank" style="display:inline-block;background:#c81e1e;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 8px 6px 0">Unresolved</a>` +
+    `<a href="${esc(answerUrl(cfg.selfUrl, ticketId, "resolved", email, w))}" target="_blank" style="display:inline-block;background:#047857;color:#fff;text-decoration:none;font-weight:700;font-size:${fs};padding:${pad};border-radius:8px;margin:0 0 6px 0">Resolved</a>`;
 }
 
 function ticketUrlFor(appUrl, t) {
@@ -431,7 +511,7 @@ function knownAddresses(master, prefs) {
 
 /** Post a batch to Postmark and read the per-message results properly. */
 async function sendBatch(cfg, messages) {
-  const out = { ok: false, sent: 0, failed: [] };
+  const out = { ok: false, sent: 0, failed: [], perMessage: [] };
   for (let i = 0; i < messages.length; i += 500) {          // Postmark caps a batch at 500
     const slice = messages.slice(i, i + 500);
     const pm = await fetch("https://api.postmarkapp.com/email/batch", {
@@ -441,10 +521,16 @@ async function sendBatch(cfg, messages) {
     });
     const results = await pm.json().catch(() => []);
     const list = Array.isArray(results) ? results : [results];
-    if (!pm.ok) { out.failed.push({ status: pm.status, detail: list }); continue; }
+    if (!pm.ok) {
+      out.failed.push({ status: pm.status, detail: list });
+      slice.forEach(m => out.perMessage.push({ ok: false, to: m.To }));
+      continue;
+    }
     list.forEach((x, j) => {
-      if (x && x.ErrorCode) out.failed.push({ to: (slice[j] || {}).To, code: x.ErrorCode, message: x.Message });
+      const bad = !!(x && x.ErrorCode);
+      if (bad) out.failed.push({ to: (slice[j] || {}).To, code: x.ErrorCode, message: x.Message });
       else out.sent++;
+      out.perMessage.push({ ok: !bad, to: (slice[j] || {}).To });
     });
   }
   out.ok = out.sent > 0 && !out.failed.length;
@@ -495,7 +581,7 @@ function summaryGM(master, person, cfg) {
           <div style="font-size:12.5px;color:#6b7280;margin-top:7px">Opened ${esc(fmtDay(t.createdAt))} by ${esc(t.createdByName || t.createdBy || "someone")}${t.assigneeLabel ? ` · assigned to ${esc(t.assigneeLabel)}` : ""}</div>
           <div style="margin-top:13px;font-size:13.5px;font-weight:700">Is this still a problem?</div>
           <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email)}</div>
-          <div style="margin-top:9px;font-size:12px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" style="color:#1d76bb">Open it in FixMi</a></div>
+          <div style="margin-top:9px;font-size:12px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" target="_blank" style="color:#1d76bb">Open it in FixMi</a></div>
         </td></tr>
       </table></td></tr>`;
   }).join("");
@@ -532,13 +618,13 @@ function summaryDM(master, person, cfg) {
      reads as a list rather than a wall of blue. */
   const rows = blocks.map(b => `<tr><td style="padding:0 24px 14px">
       <div style="font-size:14px;font-weight:700;border-bottom:1px solid #e5e7eb;padding-bottom:5px">
-        <a href="${esc(storeUrlFor(app, b.sid))}" style="color:#111827;text-decoration:none">${esc(b.label)} <span style="color:#1d76bb;font-size:12px;font-weight:400">view store &rsaquo;</span></a>
+        <a href="${esc(storeUrlFor(app, b.sid))}" target="_blank" style="color:#111827;text-decoration:none">${esc(b.label)} <span style="color:#1d76bb;font-size:12px;font-weight:400">view store &rsaquo;</span></a>
         <span style="float:right;color:#6b7280;font-weight:400">${b.tickets.length} open</span></div>
       ${b.tickets.length
         ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13.5px;line-height:1.5;margin-top:7px">${
             b.tickets.map(t => `<tr>
               <td style="padding:6px 8px 10px 0;white-space:nowrap;vertical-align:top">${priChip(t.priority)}</td>
-              <td style="padding:6px 0 10px;vertical-align:top"><a href="${esc(ticketUrlFor(app, t))}" style="color:#111827;text-decoration:none">
+              <td style="padding:6px 0 10px;vertical-align:top"><a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="color:#111827;text-decoration:none">
                 <b style="color:#1d76bb">${esc(t.shortId || "")}</b> — ${esc(t.categoryLabel || [t.category, t.subcategory].filter(Boolean).join(" › ") || "Ticket")}
                 <span style="color:#6b7280">· ${esc(STATUS_LABEL[t.status] || t.status)} · ${esc(ageOf(t.createdAt))}</span></a>
                 <div style="margin-top:6px">${answerButtons(cfg, t._id, person.email, "sm")}</div></td></tr>`).join("")
@@ -572,7 +658,7 @@ function summaryDO(master, person, cfg) {
   const total = rowsData.reduce((n, r) => n + r.n, 0);
   const worst = Math.max(1, ...rowsData.map(r => r.n));
   const rows = rowsData.map(r => `<tr>
-      <td style="padding:7px 10px 7px 0;font-size:14px;border-bottom:1px solid #f3f4f6"><a href="${esc(storeUrlFor(app, r.sid))}" style="color:#111827;text-decoration:none">${esc(r.label)}</a></td>
+      <td style="padding:7px 10px 7px 0;font-size:14px;border-bottom:1px solid #f3f4f6"><a href="${esc(storeUrlFor(app, r.sid))}" target="_blank" style="color:#111827;text-decoration:none">${esc(r.label)}</a></td>
       <td style="padding:7px 10px;width:45%;border-bottom:1px solid #f3f4f6">
         <div style="background:#f3f4f6;border-radius:999px;height:8px"><div style="background:${r.urgent ? "#e8091b" : "#1d76bb"};width:${Math.round((r.n / worst) * 100)}%;height:8px;border-radius:999px"></div></div></td>
       <td style="padding:7px 0;text-align:right;font-size:14px;font-weight:700;white-space:nowrap;border-bottom:1px solid #f3f4f6">${r.n}${r.urgent ? `<span style="color:#e8091b;font-weight:400;font-size:12px"> · ${r.urgent} urgent+</span>` : ""}</td>
@@ -632,7 +718,7 @@ function storeTile(row, app, max) {
   return `<td width="50%" style="padding:0 5px 10px" valign="top">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-left:4px solid ${SEV[worst].fill};border-radius:10px">
       <tr><td style="padding:12px 14px">
-        <a href="${esc(storeUrlFor(app, row.sid))}" style="color:#111827;text-decoration:none">
+        <a href="${esc(storeUrlFor(app, row.sid))}" target="_blank" style="color:#111827;text-decoration:none">
           <div style="font-size:13.5px;font-weight:700;line-height:1.3">${esc(row.label)}</div>
           <div style="font-size:26px;font-weight:800;line-height:1.1;margin-top:5px">${row.total}<span style="font-size:12px;font-weight:400;color:#6b7280"> open</span></div>
           ${sevBar(row.counts, row.total, max)}
@@ -698,6 +784,141 @@ function summaryVP(master, person, cfg) {
       "Every store at a glance, worst first. Tap any store to see its tickets.", inner),
     text,
   };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   REMINDERS
+
+   Some tickets are waiting on the store rather than on a technician — a
+   headset exchange where the old units have to go back, a part that has to be
+   returned. Nothing is broken, so nothing prompts anybody, and the first sign
+   of trouble is an invoice. A reminder rule watches for those: match some
+   words, wait a number of days, then nudge the people who can act.
+
+   Rules are edited in Settings → Email, so a new one never needs a redeploy.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+const REMINDER_ROLES = ["director", "dm", "gm", "tech", "reporter"];
+
+function remindersFrom(raw) {
+  return arr(raw).filter(r => r && typeof r === "object").map(r => ({
+    id: String(r.id || "").trim() || "r" + Math.random().toString(36).slice(2, 9),
+    name: String(r.name || "Reminder").trim(),
+    on: r.on !== false,
+    match: (Array.isArray(r.match) ? r.match : String(r.match || "").split(/[,\n]/))
+      .map(x => lc(x)).filter(Boolean),
+    days: Math.max(0, Number(r.days) || 0),
+    repeatDays: Math.max(0, Number(r.repeatDays) || 0),
+    to: (Array.isArray(r.to) ? r.to : []).filter(k => REMINDER_ROLES.includes(k)),
+    message: String(r.message || "").trim(),
+  })).filter(r => r.match.length && r.message && r.to.length);
+}
+
+/* Everything the rule could reasonably be looking for: what was typed when the
+   ticket was raised, what it was filed under, and anything said since — the
+   instruction about sending the old units back often arrives as a comment
+   rather than in the original description. */
+function ruleHaystack(ticket) {
+  return lc([
+    ticket.description, ticket.categoryLabel, ticket.category, ticket.subcategory,
+    ...arr(ticket.comments).map(c => c && c.text),
+  ].filter(Boolean).join("\n"));
+}
+function ruleMatches(rule, ticket) {
+  const hay = ruleHaystack(ticket);
+  return rule.match.some(phrase => hay.includes(phrase));
+}
+
+/** Which reminders are due right now, and who each one should go to. */
+function dueReminders(master, prefs, nowTs) {
+  const now = nowTs || Date.now();
+  const out = [];
+  const tickets = master.maintenanceTickets || {};
+  remindersFrom(prefs.reminders).forEach(rule => {
+    if (!rule.on) return;
+    Object.entries(tickets).forEach(([id, t]) => {
+      if (!t || !OPEN_STATUSES.includes(t.status)) return;          // closed ones are nobody's problem
+      if (!ruleMatches(rule, t)) return;
+      const ageDays = (now - (Number(t.createdAt) || now)) / 86400000;
+      if (ageDays < rule.days) return;
+      const last = Number((t.nudges || {})[rule.id]) || 0;
+      if (last) {
+        if (!rule.repeatDays) return;                                // once only, and it has been sent
+        if ((now - last) / 86400000 < rule.repeatDays) return;       // not due again yet
+      }
+      const people = reminderPeople(master, t, rule, prefs);
+      if (!people.length) return;
+      out.push({ rule, id, ticket: { ...t, _id: id }, people });
+    });
+  });
+  return out;
+}
+
+/** The rule picks roles; the store decides who fills them. */
+function reminderPeople(master, ticket, rule, prefs) {
+  const store = (master.restaurants || {})[ticket.storeId] || {};
+  const seen = new Map();
+  const put = (key, email, name, label) => {
+    if (!rule.to.includes(key)) return;
+    const e = lc(email);
+    if (e && e.includes("@") && !seen.has(e)) seen.set(e, { email: e, name: name || e, role: label });
+  };
+  const dir = (master.directors || {})[store.assignedDirectorId];
+  if (dir) put("director", dir.email, dir.name, "Director");
+  storeCoachIds(store).forEach(cid => {
+    const dm = (master.areaCoaches || {})[cid];
+    if (dm) put("dm", dm.email, dm.name, "District Manager");
+  });
+  put("gm", store.email, store.storeManager || store.storeName, "General Manager");
+  const tech = (master.repairTechnicians || {})[ticket.assignedTechId];
+  if (tech) put("tech", tech.email, tech.name, "Assigned tech");
+  put("reporter", ticket.createdBy, ticket.createdByName, "Reported by");
+  if (prefs && prefs.testMode) return seen.size ? prefs.testTo.map(e => ({ email: e, name: e, role: "Test" })) : [];
+  return [...seen.values()];
+}
+
+/** The reminder email itself: the message first, the ticket underneath. */
+function reminderBody(rule, store, ticket, cfg) {
+  const url = `${cfg.appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticket._id || "")}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
+  const facts = [
+    ["Store", storeLabel(store)],
+    ["Ticket", ticket.shortId || ""],
+    ["Status", STATUS_LABEL[ticket.status] || ticket.status],
+    ["Opened", ticket.createdAt ? `${fmtDay(ticket.createdAt)}  (${agePhrase(ticket.createdAt)})` : ""],
+  ].filter(([, v]) => String(v || "").trim());
+
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f4f6"><tr><td align="center" style="padding:24px 12px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#fff;border-radius:12px;overflow:hidden">
+  <tr><td style="background:#c2740a;padding:14px 24px;color:#fff;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">FixMi &nbsp;·&nbsp; Reminder</td></tr>
+  <tr><td style="padding:24px 24px 4px">
+    <div style="font-size:18px;font-weight:700;line-height:1.45">${esc(rule.message)}</div>
+    <div style="font-size:13.5px;color:#6b7280;margin-top:8px">Opened ${esc(agePhrase(ticket.createdAt))} at ${esc(storeLabel(store))}.</div></td></tr>
+  <tr><td style="padding:16px 24px 0"><table role="presentation" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7">
+    ${facts.map(([k, v]) => `<tr><td style="color:#6b7280;padding-right:16px;white-space:nowrap">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
+  </table></td></tr>
+  <tr><td style="padding:16px 24px 0">
+    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">The ticket says</div>
+    <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px">${esc(ticket.description || "No description")}</div></td></tr>
+  <tr><td style="padding:20px 24px 24px">
+    <a href="${esc(url)}" target="_blank" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px">Open the ticket &rarr;</a>
+    ${cfg.canReply ? `<div style="font-size:13px;color:#4b5563;margin-top:14px;line-height:1.5">
+      You can reply to this email — a tracking number, a photo, anything — and it goes straight onto the ticket.</div>` : ""}</td></tr>
+  <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af">
+    Dossani Paradise · Repair &amp; Maintenance · reminder: ${esc(rule.name)}</td></tr>
+</table></td></tr></table></body></html>`;
+
+  const text = [
+    rule.message, "",
+    `Opened ${agePhrase(ticket.createdAt)} at ${storeLabel(store)}.`, "",
+    ...facts.map(([k, v]) => `${k}: ${v}`),
+    "", "THE TICKET SAYS", ticket.description || "No description",
+    "", `Open the ticket: ${url}`,
+    ...(cfg.canReply ? ["", "You can reply to this email and it goes straight onto the ticket."] : []),
+  ].join("\n");
+
+  return { subject: `[${ticket.shortId || "Ticket"}] ${storeLabel(store)} — ${rule.name}`, html, text, url };
 }
 
 /* Everyone who should get a summary, and what each of them should see. Roles
@@ -775,7 +996,7 @@ module.exports = async (req, res) => {
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
     if (secret !== want) return res.status(401).json({ error: "bad secret" });
-    const DIAG = ["selftest", "sendtest", "postmark", "summary"];
+    const DIAG = ["selftest", "sendtest", "postmark", "summary", "reminders"];
     if (!EVENTS.includes(event) && !DIAG.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
     if (!ticketId && !DIAG.includes(event)) return res.status(400).json({ error: "ticketId is required" });
 
@@ -1004,6 +1225,85 @@ module.exports = async (req, res) => {
       const r3 = await sendBatch(cfg, messages);
       console.log("[fixmi-notify] weekly summaries", { testMode: prefs0.testMode, built: log.length, sent: r3.sent });
       return res.status(200).json({ ok: r3.ok, sent: r3.sent, testMode: prefs0.testMode, people: log, failed: r3.failed });
+    }
+
+    /* ---- REMINDERS ---------------------------------------------------------
+       mode "due" just reports what would go out; anything else sends it. The
+       caller writes the "already nudged" stamps back onto the tickets, since
+       it is the one holding the write password. */
+    if (event === "reminders") {
+      const prefs0 = prefsFrom(master);
+      const rCfg = { appUrl: cfg.appUrl, canReply: !!cfg.replyDomain };
+      const due = dueReminders(master, prefs0, Number(body.now) || Date.now());
+      const rows = due.map(d => ({
+        rule: d.rule.name, ruleId: d.rule.id, ticketId: d.id,
+        shortId: d.ticket.shortId || d.id,
+        store: storeLabel((master.restaurants || {})[d.ticket.storeId] || {}),
+        openFor: agePhrase(d.ticket.createdAt),
+        to: d.people.map(p => p.email),
+      }));
+      if (body.mode === "due" || !prefs0.on) {
+        return res.status(200).json({ ok: true, due: rows, sent: 0,
+          ...(prefs0.on ? {} : { reason: "notifications are switched off in Settings → Email" }) });
+      }
+      if (!due.length) return res.status(200).json({ ok: true, due: [], sent: 0, reason: "nothing is due" });
+      if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+
+      const messages = [], owner = [];         // owner[i] is the due item message i belongs to
+      due.forEach((d, di) => {
+        const store = (master.restaurants || {})[d.ticket.storeId] || {};
+        const built = reminderBody(d.rule, store, d.ticket, rCfg);
+        const thread = `<fixmi-${d.id}@dossaniparadise.com>`;   // sits in the ticket's own thread
+        d.people.forEach(p => { owner.push(di); messages.push({
+          From: `FixMi <${cfg.from}>`,
+          To: `"${String(p.name).replace(/"/g, "")}" <${p.email}>`,
+          ...(cfg.replyDomain ? { ReplyTo: `reply+${d.id}@${cfg.replyDomain}` } : {}),
+          Subject: built.subject, HtmlBody: built.html, TextBody: built.text,
+          MessageStream: cfg.stream, Tag: "reminder",
+          Headers: [{ Name: "In-Reply-To", Value: thread }, { Name: "References", Value: thread }],
+          Metadata: { ticketId: d.id, rule: d.rule.id },
+          TrackOpens: false, TrackLinks: "None",
+        }); });
+      });
+      const rr = await sendBatch(cfg, messages);
+
+      /* Stamp the tickets here rather than leaving it to whoever called, so a
+         reminder sent by hand from Settings counts the same as one sent by the
+         nightly run — otherwise the same nudge goes out again a few hours
+         later. Only tickets that actually got an email are stamped. */
+      const landed = new Set();
+      rr.perMessage.forEach((m, i) => { if (m.ok && owner[i] !== undefined) landed.add(owner[i]); });
+      let stamped = 0, stampError = null;
+      const writePass = process.env.FIXMI_WRITE_PASSWORD || "";
+      if (landed.size && writePass) {
+        const updates = {};
+        [...landed].forEach(di => {
+          const d = due[di];
+          const base = updates[`${"maintenanceTickets"}/${d.id}`] || (master.maintenanceTickets || {})[d.id];
+          if (!base) return;
+          updates[`maintenanceTickets/${d.id}`] = {
+            ...base,
+            nudges: { ...(base.nudges || {}), [d.rule.id]: Date.now() },
+            activity: [...(Array.isArray(base.activity) ? base.activity : []),
+              { ts: Date.now(), by: "FixMi", role: "system", action: "reminder", note: `Reminder sent — ${d.rule.name}` }],
+          };
+        });
+        if (Object.keys(updates).length) {
+          try {
+            const w = await fetch(cfg.masterUrl, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ password: writePass, updates }),
+            });
+            if (w.ok) { stamped = Object.keys(updates).length; Object.entries(updates).forEach(([k, v]) => { master.maintenanceTickets[k.split("/")[1]] = v; }); }
+            else stampError = `HTTP ${w.status}`;
+          } catch (e) { stampError = (e && e.message) || String(e); }
+        }
+      } else if (landed.size && !writePass) {
+        stampError = "FIXMI_WRITE_PASSWORD is not set, so these will go out again";
+      }
+
+      console.log("[fixmi-notify] reminders", { due: due.length, sent: rr.sent, stamped, testMode: prefs0.testMode });
+      return res.status(200).json({ ok: rr.ok, sent: rr.sent, stamped, stampError, testMode: prefs0.testMode, due: rows, failed: rr.failed });
     }
 
     if (event === "sendtest") {
