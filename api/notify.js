@@ -67,7 +67,12 @@ const PREF_DEFAULTS = {
   on: true,
   roles: { director: { created: true, status: true, comment: true }, dm: { created: true, status: true, comment: true },
            gm: { created: true, status: true, comment: true },
-           tech: { created: false, status: false, comment: false }, reporter: { created: false, status: false, comment: false } },
+           tech: { created: false, status: false, comment: false }, reporter: { created: false, status: false, comment: false },
+           /* Anyone who joined the thread from outside — a vendor who replied
+              to a FixMi email, a guest who commented on a share link. They
+              were being recorded on the ticket and then never written to
+              again, so a conversation with an outside vendor went one way. */
+           watcher: { created: false, status: false, comment: true } },
   testMode: false, testTo: [], alwaysTo: [],
   /* The VP summary has no role behind it — it goes to a named list. */
   vpTo: [],
@@ -186,6 +191,7 @@ function recipientsFor(master, ticket, opts) {
   const tech = (master.repairTechnicians || {})[ticket.assignedTechId];
   if (tech) put(tech.email, tech.name, "Assigned tech", "tech");
   put(ticket.createdBy, ticket.createdByName, "Reported by", "reporter");
+  arr(ticket.guestWatchers).forEach(e => put(e, e, "On the thread", "watcher"));
 
   // Never tell someone about the thing they just did.
   if (opts.actorEmail) out.delete(lc(opts.actorEmail));
@@ -239,21 +245,6 @@ const STATUS_TONE = {
 function plainAssignee(a) {
   return String(a || "").replace(/^[^\w(]+/, "").replace(/\s*\((in-house|third-party)\)\s*$/i, "").trim();
 }
-/** What happens next, in the reader's terms. */
-function nextStepFor(status, ticket, who) {
-  switch (status) {
-    case "unassigned":  return "Nobody is on it yet — it needs assigning before anything else happens.";
-    case "assigned":    return who ? `${who} has it and will arrange a visit. Nothing needed from the store yet.`
-                                   : "Nothing needed from the store yet.";
-    case "dispatched":  return who ? `${who} is on the way. Nothing needed from the store until they arrive.`
-                                   : "Someone is on the way.";
-    case "in_progress": return "Work is happening now. You'll get another email when it's done.";
-    case "waiting":     return "Nobody is working on it until that clears. It stays open and will keep appearing on the weekly summary.";
-    case "finished":    return "The work is done. It stays open until someone reviews it and closes it off in FixMi.";
-    case "closed":      return "Nothing further — this one is done and closed.";
-    default: return "";
-  }
-}
 function headlineFor(event, store, ticket, prevStatus, comment, extra) {
   const who = storeLabel(store);
   if (event === "created") return `${who} has a new ticket open.`;
@@ -261,20 +252,22 @@ function headlineFor(event, store, ticket, prevStatus, comment, extra) {
 
   const assignee = (extra && extra.assignee) || ticket.assigneeLabel || "";
   const name = plainAssignee(assignee);
-  // Who it's on beats which column it sits in — lead with that when it changed.
-  if (extra && extra.assigneeChanged) {
-    return name ? `${who} — now with ${name}.` : `${who} — back in the queue, nobody assigned.`;
-  }
+  /* One sentence that fits every assignee — a technician, a plumbing firm, or
+     a holding queue like "Reminders". Who it is on beats which column it sits
+     in, so lead with that when it changed. */
+  const assignedLine = name ? `${who} — this ticket has been assigned to ${name}.`
+                            : `${who} — this ticket is back in the queue, with nobody assigned.`;
+  if (extra && extra.assigneeChanged) return assignedLine;
   switch (ticket.status) {
     case "closed":      return `${who} — this ticket is closed.`;
-    case "finished":    return `${who} — the work is done.`;
-    case "in_progress": return name ? `${who} — ${name} has started work.` : `${who} — work has started.`;
+    case "finished":    return `${who} — the work on this ticket is done.`;
+    case "in_progress": return `${who} — work has started on this ticket.`;
     // The reason is already phrased as "Awaiting parts", so "waiting on
     // awaiting parts" would stutter.
-    case "waiting":     return `${who} — paused${ticket.waitingReason ? ", " + String(ticket.waitingReason).charAt(0).toLowerCase() + String(ticket.waitingReason).slice(1) : ""}.`;
-    case "unassigned":  return `${who} — back in the queue, nobody assigned.`;
-    case "assigned":    return name ? `${who} — assigned to ${name}.` : `${who} — assigned.`;
-    case "dispatched":  return name ? `${who} — ${name} is on the way.` : `${who} — a technician is on the way.`;
+    case "waiting":     return `${who} — this ticket is paused${ticket.waitingReason ? ", " + String(ticket.waitingReason).charAt(0).toLowerCase() + String(ticket.waitingReason).slice(1) : ""}.`;
+    case "unassigned":  return `${who} — this ticket is back in the queue, with nobody assigned.`;
+    case "assigned":
+    case "dispatched":  return assignedLine;
   }
   const to = STATUS_LABEL[ticket.status] || ticket.status || "updated";
   const from = STATUS_LABEL[prevStatus] || prevStatus;
@@ -351,12 +344,6 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     </tr></table>
     <div style="font-size:12.5px;color:#6b7280;margin-top:8px">Changed by ${esc(actorName || "someone")} · ${esc(fmtWhen(Date.now()))}</div>
   </td></tr>` : "";
-  const nextStep = isStatus ? nextStepFor(ticket.status, ticket, plainAssignee(assignee)) : "";
-  const nextBlock = nextStep ? `<tr><td style="padding:14px 24px 0">
-    <div style="background:#f9fafb;border-left:4px solid ${tone};border-radius:0 9px 9px 0;padding:11px 14px;font-size:14.5px;line-height:1.5">
-      <b style="font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:#6b7280;display:block;margin-bottom:3px">What happens next</b>
-      ${esc(nextStep)}</div></td></tr>` : "";
-
   const facts = [
     ["Store", storeLabel(store)],
     // On a status email the status is the headline, the band and the next-step
@@ -381,7 +368,6 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
   <tr><td style="padding:24px 24px 6px"><div style="font-size:19px;font-weight:700;line-height:1.35">${esc(headline)}</div>
     ${isStatus ? "" : `<div style="font-size:14px;color:#6b7280;margin-top:6px">See details below.</div>`}</td></tr>
   ${changeBand}
-  ${nextBlock}
   ${newCommentBlock}
   <tr><td style="padding:14px 24px 0"><table role="presentation" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7">
     ${facts.map(([k, v]) => `<tr><td style="color:#6b7280;padding-right:16px;white-space:nowrap">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
@@ -398,9 +384,9 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Conversation · ${convo.length} comment${convo.length === 1 ? "" : "s"}</div>
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0">${convoHtml}</table>
   </td></tr>` : ""}
-  ${canReply ? `<tr><td style="padding:18px 24px 0"><div style="font-size:13px;color:#6b7280;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:11px 14px">
-    <b style="color:#111827">You can just reply to this email.</b> Your reply is added to the ticket as a comment and everyone else on it is notified.</div></td></tr>` : ""}
-  <tr><td style="padding:24px"><a href="${esc(url)}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px" target="_blank">See more on FixMi →</a></td></tr>
+  <tr><td style="padding:24px 24px 6px"><a href="${esc(url)}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px" target="_blank">Open in FixMi →</a>
+    ${canReply ? `<div style="font-size:13px;color:#9ca3af;margin-top:12px">Reply to this email to add a comment.</div>` : ""}</td></tr>
+  <tr><td style="height:12px"></td></tr>
   <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af">Dossani Paradise · Repair &amp; Maintenance · Ticket ${esc(ticket.shortId || "")}</td></tr>
 </table></td></tr></table></body></html>`;
 
@@ -412,7 +398,6 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
       moved ? `${STATUS_LABEL[prevStatus] || prevStatus}  →  ${STATUS_LABEL[ticket.status] || ticket.status}`
             : `Now: ${STATUS_LABEL[ticket.status] || ticket.status}`,
       `Changed by ${actorName || "someone"} · ${fmtWhen(Date.now())}`,
-      ...(nextStep ? ["", "WHAT HAPPENS NEXT", nextStep] : []),
       "",
     ] : []),
     ...facts.map(([k, v]) => `${k}: ${v}`),
@@ -421,7 +406,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     ...(closeNote ? ["", `CLOSING NOTES · ${closeNote.by || ""}`, closeNote.text] : []),
     ...(convo.length ? ["", `CONVERSATION (${convo.length})`,
       ...convo.map((c, i) => `${i + 1}. ${c.by || "Someone"} · ${fmtWhen(c.ts)}${(Number(c.ts) || 0) === newestTs ? "  ← newest" : ""}\n   ${(c.text || "").replace(/\n/g, "\n   ")}`)] : []),
-    ...(canReply ? ["", "Reply to this email and your reply is added to the ticket as a comment."] : []),
+    ...(canReply ? ["", "Reply to this email to add a comment."] : []),
     "", `See more on FixMi: ${url}`,
     "", "--", "Dossani Paradise · Repair & Maintenance",
   ].join("\n");
@@ -565,8 +550,8 @@ function summaryGM(master, person, cfg) {
   if (!tickets.length) {
     return {
       subject: `FixMi weekly — ${label}: nothing open`,
-      html: shell(`Nothing open at ${label}`, "No maintenance tickets are outstanding this week. Nothing for you to do.",
-        `<tr><td style="padding:14px 24px 24px"><div style="font-size:15px;line-height:1.55;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">All clear. If something breaks, open a ticket in FixMi and it will appear here next week.</div></td></tr>`),
+      html: shell(`Nothing open at ${label}`, "No open tickets this week.",
+        `<tr><td style="padding:14px 24px 24px"><div style="font-size:15px;line-height:1.55;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">All clear.</div></td></tr>`),
       text: `Nothing open at ${label}.\n\nNo maintenance tickets are outstanding this week.`,
     };
   }
@@ -579,7 +564,7 @@ function summaryGM(master, person, cfg) {
           ${cat ? `<div style="font-size:13px;color:#6b7280;margin-top:5px">${esc(cat)}</div>` : ""}
           <div style="font-size:15px;line-height:1.5;margin-top:6px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
           <div style="font-size:12.5px;color:#6b7280;margin-top:7px">Opened ${esc(fmtDay(t.createdAt))} by ${esc(t.createdByName || t.createdBy || "someone")}${t.assigneeLabel ? ` · assigned to ${esc(t.assigneeLabel)}` : ""}</div>
-          <div style="margin-top:13px;font-size:13.5px;font-weight:700">Is this still a problem?</div>
+          <div style="margin-top:13px;font-size:13px;color:#6b7280">Still a problem?</div>
           <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email)}</div>
           <div style="margin-top:9px;font-size:12px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" target="_blank" style="color:#1d76bb">Open it in FixMi</a></div>
         </td></tr>
@@ -590,7 +575,7 @@ function summaryGM(master, person, cfg) {
     ...tickets.map(t => [
       `${t.shortId} · ${PRIORITY_LABEL[lc(t.priority)] || "Normal"} · ${STATUS_LABEL[t.status] || t.status} · open ${ageOf(t.createdAt)}`,
       t.description || "No description",
-      `Still a problem?  UNRESOLVED: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}`,
+      `UNRESOLVED: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp)}`,
       `                  RESOLVED:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp)}`,
       "",
     ].join("\n")),
@@ -598,7 +583,7 @@ function summaryGM(master, person, cfg) {
   return {
     subject: `FixMi weekly — ${label}: ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`,
     html: shell(`${tickets.length} open at ${label}`,
-      "Mark each one Unresolved or Resolved. One tap — it is written straight onto the ticket, and Resolved moves it to Finished.",
+      "Resolved moves a ticket to Finished. Unresolved just notes it.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
@@ -637,7 +622,7 @@ function summaryDM(master, person, cfg) {
   return {
     subject: `FixMi weekly — ${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
     html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
-      "Every open ticket on your patch, busiest store first. Tap a store to see all of its tickets, a line to open that one, or mark it Unresolved / Resolved from here.",
+      "Busiest store first.",
       `<tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
@@ -668,7 +653,7 @@ function summaryDO(master, person, cfg) {
   return {
     subject: `FixMi weekly — ${total} open across ${rowsData.length} stores`,
     html: shell(`${total} open across ${rowsData.length} stores`,
-      "Open ticket count per store, most to least. Tap a store to see its tickets.",
+      "Most to least.",
       `<tr><td style="padding:14px 24px 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${rows}</table></td></tr>`),
     text,
   };
@@ -765,7 +750,7 @@ function summaryVP(master, person, cfg) {
       Stores with something open · ${busy.length}</td></tr>
     <tr><td style="padding:0 19px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed">${grid}</table></td></tr>`
     : `<tr><td style="padding:16px 24px 8px"><div style="font-size:15px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:14px 16px">
-        Nothing open anywhere this week.</div></td></tr>`}
+        Nothing open anywhere.</div></td></tr>`}
   ${clear.length ? `<tr><td style="padding:14px 24px 20px;font-size:12.5px;color:#6b7280;line-height:1.6">
       <b style="color:#059669">All clear (${clear.length}):</b> ${clear.map(r => esc(r.label)).join(" · ")}</td></tr>` : `<tr><td style="height:12px"></td></tr>`}`;
 
@@ -781,7 +766,7 @@ function summaryVP(master, person, cfg) {
   return {
     subject: `FixMi weekly — ${total} open across ${busy.length} store${busy.length === 1 ? "" : "s"}${tot.emergency ? `, ${tot.emergency} emergency` : ""}`,
     html: shell(`${total} open across ${busy.length} of ${rows.length} stores`,
-      "Every store at a glance, worst first. Tap any store to see its tickets.", inner),
+      "Worst first.", inner),
     text,
   };
 }
@@ -894,28 +879,27 @@ function reminderBody(rule, store, ticket, cfg) {
   <tr><td style="background:#c2740a;padding:14px 24px;color:#fff;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">FixMi &nbsp;·&nbsp; Reminder</td></tr>
   <tr><td style="padding:24px 24px 4px">
     <div style="font-size:18px;font-weight:700;line-height:1.45">${esc(rule.message)}</div>
-    <div style="font-size:13.5px;color:#6b7280;margin-top:8px">Opened ${esc(agePhrase(ticket.createdAt))} at ${esc(storeLabel(store))}.</div></td></tr>
+    <div style="font-size:13.5px;color:#6b7280;margin-top:8px">${esc(storeLabel(store))} · opened ${esc(agePhrase(ticket.createdAt))}</div></td></tr>
   <tr><td style="padding:16px 24px 0"><table role="presentation" cellspacing="0" cellpadding="0" style="font-size:14px;line-height:1.7">
     ${facts.map(([k, v]) => `<tr><td style="color:#6b7280;padding-right:16px;white-space:nowrap">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
   </table></td></tr>
   <tr><td style="padding:16px 24px 0">
-    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">The ticket says</div>
+    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Issue</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px">${esc(ticket.description || "No description")}</div></td></tr>
   <tr><td style="padding:20px 24px 24px">
     <a href="${esc(url)}" target="_blank" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 22px;border-radius:8px">Open the ticket &rarr;</a>
-    ${cfg.canReply ? `<div style="font-size:13px;color:#4b5563;margin-top:14px;line-height:1.5">
-      You can reply to this email — a tracking number, a photo, anything — and it goes straight onto the ticket.</div>` : ""}</td></tr>
+    ${cfg.canReply ? `<div style="font-size:13px;color:#9ca3af;margin-top:12px">Reply to this email to add a comment.</div>` : ""}</td></tr>
   <tr><td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:14px 24px;font-size:12px;color:#9ca3af">
     Dossani Paradise · Repair &amp; Maintenance · reminder: ${esc(rule.name)}</td></tr>
 </table></td></tr></table></body></html>`;
 
   const text = [
     rule.message, "",
-    `Opened ${agePhrase(ticket.createdAt)} at ${storeLabel(store)}.`, "",
+    `${storeLabel(store)} · opened ${agePhrase(ticket.createdAt)}`, "",
     ...facts.map(([k, v]) => `${k}: ${v}`),
-    "", "THE TICKET SAYS", ticket.description || "No description",
+    "", "ISSUE", ticket.description || "No description",
     "", `Open the ticket: ${url}`,
-    ...(cfg.canReply ? ["", "You can reply to this email and it goes straight onto the ticket."] : []),
+    ...(cfg.canReply ? ["", "Reply to this email to add a comment."] : []),
   ].join("\n");
 
   return { subject: `[${ticket.shortId || "Ticket"}] ${storeLabel(store)} — ${rule.name}`, html, text, url };
