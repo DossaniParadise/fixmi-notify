@@ -191,6 +191,11 @@ function recipientsFor(master, ticket, opts) {
   put(store.email, store.storeManager || store.storeName, "General Manager", "gm");
   const tech = (master.repairTechnicians || {})[ticket.assignedTechId];
   if (tech) put(tech.email, tech.name, "Assigned tech", "tech");
+  /* A DM the ticket has been handed to is already in the list as a District
+     Manager, but they have been asked to do something — so they are added
+     under the "dm" key regardless, and the role label says which it is. */
+  const owner = (master.areaCoaches || {})[ticket.assignedCoachId];
+  if (owner) put(owner.email, owner.name, "Assigned District Manager", "dm");
   put(ticket.createdBy, ticket.createdByName, "Reported by", "reporter");
   arr(ticket.guestWatchers).forEach(e => put(e, e, "On the thread", "watcher"));
 
@@ -244,7 +249,7 @@ const STATUS_TONE = {
 };
 /** Drop the decoration so a name reads as a name inside a sentence. */
 function plainAssignee(a) {
-  return String(a || "").replace(/^[^\w(]+/, "").replace(/\s*\((in-house|third-party)\)\s*$/i, "").trim();
+  return String(a || "").replace(/^[^\w(]+/, "").replace(/\s*\((in-house|third-party|District Manager)\)\s*$/i, "").trim();
 }
 function headlineFor(event, store, ticket, prevStatus, comment, extra) {
   const who = storeLabel(store);
@@ -305,6 +310,10 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
   const url = `${appUrl.replace(/#.*$/, "")}#t/${encodeURIComponent(ticket.shortId || ticket._id || "")}${ticket.shareToken ? "/" + ticket.shareToken : ""}`;
   const headline = headlineFor(event, store, ticket, prevStatus, comment, extra);
   const closeNote = ticket.closeNote && ticket.closeNote.text ? ticket.closeNote : null;
+  /* Instructions written when a job was handed to a District Manager. They are
+     the reason that assignment exists, so they travel with every email about
+     the ticket until it is closed out, not just the one that announced it. */
+  const assignNote = ticket.assignNote && ticket.assignNote.text && ticket.status !== "closed" ? ticket.assignNote : null;
   const assignee = (extra && extra.assignee) || ticket.assigneeLabel || "";
   const photos = arr(ticket.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6);
   const cPhotos = comment ? arr(comment.photos).filter(u => typeof u === "string" && /^https?:/i.test(u)).slice(0, 6) : [];
@@ -377,6 +386,10 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Issue${ticket.createdAt ? ` <span style="font-weight:400;text-transform:none;letter-spacing:0">· ${esc(ticket.createdByName || ticket.createdBy || "")} · ${esc(fmtDay(ticket.createdAt))}</span>` : ""}</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px">${esc(ticket.description || "No description")}</div></td></tr>
   ${photos.length ? `<tr><td style="padding:14px 24px 0">${photos.map(u => `<a href="${esc(u)}" target="_blank"><img src="${esc(u)}" width="160" alt="Ticket photo" style="width:160px;max-width:100%;height:auto;border-radius:8px;border:1px solid #e5e7eb;display:inline-block;margin:0 8px 8px 0"></a>`).join("")}</td></tr>` : ""}
+  ${assignNote ? `<tr><td style="padding:18px 24px 0">
+    <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Instructions${assignNote.to ? ` for ${esc(assignNote.to)}` : ""} · ${esc(assignNote.by || "")}</div>
+    <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px 14px">${esc(assignNote.text)}</div>
+  </td></tr>` : ""}
   ${closeNote ? `<tr><td style="padding:18px 24px 0">
     <div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Closing notes · ${esc(closeNote.by || "")}</div>
     <div style="font-size:15px;line-height:1.55;white-space:pre-wrap;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 14px">${esc(closeNote.text)}</div>
@@ -404,6 +417,7 @@ function bodyFor({ event, store, ticket, prevStatus, appUrl, actorName, comment,
     ...facts.map(([k, v]) => `${k}: ${v}`),
     "", "ISSUE", ticket.description || "No description",
     ...(photos.length ? ["", "PHOTOS", ...photos] : []),
+    ...(assignNote ? ["", `INSTRUCTIONS${assignNote.to ? ` FOR ${String(assignNote.to).toUpperCase()}` : ""} · ${assignNote.by || ""}`, assignNote.text] : []),
     ...(closeNote ? ["", `CLOSING NOTES · ${closeNote.by || ""}`, closeNote.text] : []),
     ...(convo.length ? ["", `CONVERSATION (${convo.length})`,
       ...convo.map((c, i) => `${i + 1}. ${c.by || "Someone"} · ${fmtWhen(c.ts)}${(Number(c.ts) || 0) === newestTs ? "  ← newest" : ""}\n   ${(c.text || "").replace(/\n/g, "\n   ")}`)] : []),
@@ -1463,6 +1477,8 @@ function reminderPeople(master, ticket, rule, prefs) {
   put("gm", store.email, store.storeManager || store.storeName, "General Manager");
   const tech = (master.repairTechnicians || {})[ticket.assignedTechId];
   if (tech) put("tech", tech.email, tech.name, "Assigned tech");
+  const owner = (master.areaCoaches || {})[ticket.assignedCoachId];
+  if (owner) put("dm", owner.email, owner.name, "Assigned District Manager");
   put("reporter", ticket.createdBy, ticket.createdByName, "Reported by");
   if (prefs && prefs.testMode) return seen.size ? prefs.testTo.map(e => ({ email: e, name: e, role: "Test" })) : [];
   return [...seen.values()];
