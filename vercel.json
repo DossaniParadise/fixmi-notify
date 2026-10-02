@@ -4,6 +4,7 @@
     "api/notify.js": { "maxDuration": 15 },
     "api/inbound.js": { "maxDuration": 20 },
     "api/answer.js": { "maxDuration": 20 },
+    "api/monday.js": { "maxDuration": 20 },
     "api/weekly.js": { "maxDuration": 60 }
   },
   "crons": [
