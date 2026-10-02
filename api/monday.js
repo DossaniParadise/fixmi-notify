@@ -52,16 +52,20 @@ const TAG = "via Monday update";
 /* ---- the link ------------------------------------------------------------
    Signed over the person, their role and the week. `role` matters: it decides
    both which stores they see and whether their "resolved" moves the ticket. */
-function sign(email, role, week) {
+function sign(email, role, week, preview) {
   return crypto.createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
-    .update(`monday|${lc(email)}|${lc(role)}|${week || ""}`).digest("hex").slice(0, 32);
+    .update(`monday|${lc(email)}|${lc(role)}|${week || ""}${preview ? "|p" : ""}`).digest("hex").slice(0, 32);
 }
 function sigOk(given, want) {
   const a = Buffer.from(String(given || ""), "utf8"), b = Buffer.from(want, "utf8");
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
-function mondayUrl(base, email, role, week) {
-  const q = new URLSearchParams({ e: lc(email), r: lc(role), w: week || "", s: sign(email, role, week) });
+function mondayUrl(base, email, role, week, preview) {
+  const q = new URLSearchParams({
+    e: lc(email), r: lc(role), w: week || "",
+    ...(preview ? { p: "1" } : {}),
+    s: sign(email, role, week, preview),
+  });
   return `${String(base).replace(/\/$/, "")}/api/monday?${q}`;
 }
 
@@ -161,6 +165,12 @@ function shell(inner, title) {
   body{margin:0;background:var(--bg);color:var(--ink);
     font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
   .wrap{max-width:620px;margin:0 auto;padding:20px 14px 110px}
+  .pv{background:#fef3c7;border:1px solid #d9a404;color:#5b4408;border-radius:10px;
+    padding:12px 14px;font-size:13.5px;line-height:1.55;margin:0 0 14px}
+  .pv b{display:block;margin-bottom:2px}
+  /* After the light rule, not up with the other dark tokens — same specificity,
+     so whichever comes last wins. */
+  @media (prefers-color-scheme: dark){.pv{background:#3a2f0b;border-color:#8a6d0d;color:#fde68a}}
   .hd{padding:6px 4px 16px}
   .hd h1{font-size:23px;margin:0 0 6px;line-height:1.25}
   .hd p{margin:0;color:var(--dim);font-size:14.5px;line-height:1.5}
@@ -215,7 +225,7 @@ function ticketCard(t, store, chosen) {
   </div>`;
 }
 
-function buildPage({ master, email, role, week, selfUrl, q }) {
+function buildPage({ master, email, role, week, selfUrl, q, preview }) {
   const sids = storesFor(master, email, role);
   const stores = master.restaurants || {};
   const blocks = sids.map(sid => ({ sid, label: storeLabel(stores[sid] || {}), tickets: openTicketsFor(master, sid) }))
@@ -224,23 +234,36 @@ function buildPage({ master, email, role, week, selfUrl, q }) {
   const total = blocks.reduce((n, b) => n + b.tickets.length, 0);
   const answered = blocks.reduce((n, b) => n + b.tickets.filter(t => answeredBy(t, email, week)).length, 0);
 
-  const who = role === "dm" ? "your stores" : "your store";
+  const whoName = nameFor(master, email, role);
+  const who = preview ? (role === "dm" ? "these stores" : "this store")
+                      : (role === "dm" ? "your stores" : "your store");
+  /* A sample is somebody else's page. Say whose, at the top, before anything
+     else — otherwise it reads as a live list of tickets you are responsible
+     for, and the switches look like they did something. */
+  const banner = preview
+    ? `<div class="pv"><b>Sample — nothing here is saved.</b> This is the page ${esc(whoName)}
+         (${esc(email)}) will get as ${role === "dm" ? "a District Manager" : "a General Manager"}.
+         The switches move so you can see how it behaves; no comment is written and no ticket moves.</div>`
+    : "";
   const head = `<div class="hd">
     <h1>${total ? `${total} open ticket${total === 1 ? "" : "s"} at ${who}` : `Nothing open at ${who}`}</h1>
-    <p>${total
-      ? "Tap <b>Still broken</b> or <b>Sorted</b> against each one. Each tap saves on its own — there is no button at the end, and nothing here emails anybody."
-      : "Nothing needs an answer this week."}</p>
+    <p>${!total ? "Nothing needs an answer this week."
+      : preview
+        ? "Tap <b>Still broken</b> or <b>Sorted</b> against any of them — the switch flips and that is all that happens."
+        : "Tap <b>Still broken</b> or <b>Sorted</b> against each one. Each tap saves on its own — there is no button at the end, and nothing here emails anybody."}</p>
   </div>`;
 
   const body = blocks.map(b => `<div class="store">${esc(b.label)} · ${b.tickets.length}</div>` +
     b.tickets.map(t => ticketCard(t, stores[b.sid] || {}, answeredBy(t, email, week))).join("")).join("");
 
   const bar = total
-    ? `<div class="bar" id="bar"><b><span id="n">${answered}</span> of ${total}</b> answered — you can close this page at any time.</div>`
+    ? `<div class="bar" id="bar"><b><span id="n">${answered}</span> of ${total}</b> answered — ${preview
+        ? "this is a sample, so none of it is recorded."
+        : "you can close this page at any time."}</div>`
     : "";
 
   const js = `<script>
-    var POST=${JSON.stringify(`${selfUrl}/api/monday`)},Q=${JSON.stringify(q)},TOTAL=${total};
+    var POST=${JSON.stringify(`${selfUrl}/api/monday`)},Q=${JSON.stringify(q)},TOTAL=${total},PREVIEW=${preview ? "true" : "false"};
     var done={};${blocks.flatMap(b => b.tickets.filter(t => answeredBy(t, email, week))
       .map(t => `done[${JSON.stringify(t._id)}]=1;`)).join("")}
     /* One flip at a time, in the order they were tapped. A manager going down
@@ -251,7 +274,7 @@ function buildPage({ master, email, role, week, selfUrl, q }) {
       var card=document.getElementById("t_"+id);
       var btns=card.querySelectorAll(".track button");
       for(var i=0;i<btns.length;i++)btns[i].setAttribute("aria-pressed",String(btns[i].className===(answer==="resolved"?"yes":"no")));
-      say(id,"Saving…","");
+      say(id,PREVIEW?"Checking…":"Saving…","");
       queue=queue.filter(function(x){return x.id!==id});   // a change of mind replaces the pending one
       queue.push({id:id,answer:answer});
       pump();
@@ -267,7 +290,7 @@ function buildPage({ master, email, role, week, selfUrl, q }) {
         .then(function(r){return r.json().catch(function(){return {}})})
         .then(function(j){
           if(card)card.classList.remove("busy");
-          if(j&&j.ok){say(job.id,"Saved","ok");if(!done[job.id]){done[job.id]=1;count()}}
+          if(j&&j.ok){say(job.id,j.preview?"Sample — not saved":"Saved",j.preview?"":"ok");if(!done[job.id]){done[job.id]=1;count()}}
           else say(job.id,(j&&j.error)||"Didn't save — tap again","err");
         })
         .catch(function(){if(card)card.classList.remove("busy");say(job.id,"No connection — tap again","err")})
@@ -276,8 +299,8 @@ function buildPage({ master, email, role, week, selfUrl, q }) {
     function count(){var n=document.getElementById("n");if(n)n.textContent=String(Object.keys(done).length)}
   <\/script>`;
 
-  return shell(head + (body || `<div class="done">Nothing to answer. Enjoy the quiet.</div>`) + bar + js,
-    `FixMi — ${total} to answer`);
+  return shell(banner + head + (body || `<div class="done">Nothing to answer. Enjoy the quiet.</div>`) + bar + js,
+    `FixMi — ${preview ? "sample, " : ""}${total} to answer`);
 }
 
 function errPage(title, line) {
@@ -347,8 +370,12 @@ module.exports = async (req, res) => {
     const body = post ? (typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {})) : {};
     const q = post ? (body.q || {}) : (req.query || {});
     const email = lc(q.e), role = lc(q.r), week = String(q.w || "").trim();
+    /* A sample link, sent by the "Email it to me" button. It is signed over
+       the flag as well, so nobody can add p=1 to a real link (or strip it off
+       a sample one) to change what the page does. */
+    const preview = String(q.p || "") === "1";
 
-    if (!email || !["gm", "dm"].includes(role) || !sigOk(q.s, sign(email, role, week)))
+    if (!email || !["gm", "dm"].includes(role) || !sigOk(q.s, sign(email, role, week, preview)))
       return post ? json(403, { ok: false, error: "This link isn't valid" })
                   : html(403, errPage("That link isn't valid", "It may have been altered or retyped. Open FixMi and comment on the ticket instead."));
 
@@ -356,6 +383,10 @@ module.exports = async (req, res) => {
       if (!writePass) return json(500, { ok: false, error: "Server can't save right now" });
       const answer = lc(body.answer);
       if (!["resolved", "unresolved"].includes(answer)) return json(400, { ok: false, error: "Unknown answer" });
+      /* Before any read and any write. A sample has to be able to go nowhere
+         near somebody's live tickets — the switch moves, the page says so,
+         and the master is never touched. */
+      if (preview) return json(200, { ok: true, preview: true });
       /* Within a couple of seconds of the last read, reuse it: that is one
          person still tapping, and their own writes are already folded into it.
          Any longer and read fresh, so two people answering the same ticket
@@ -370,7 +401,10 @@ module.exports = async (req, res) => {
     /* A page load is rare — one per person per visit — so it always reads
        fresh. Anything raised since the email went out has to be on it. */
     const master = await readMaster(masterUrl, true);
-    return html(200, buildPage({ master, email, role, week, selfUrl, q: { e: email, r: role, w: week, s: q.s } }));
+    return html(200, buildPage({
+      master, email, role, week, selfUrl, preview,
+      q: { e: email, r: role, w: week, ...(preview ? { p: "1" } : {}), s: q.s },
+    }));
   } catch (e) {
     console.error("[fixmi-monday] crashed", e);
     return req.method === "POST"
