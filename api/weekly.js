@@ -73,7 +73,31 @@ module.exports = async (req, res) => {
       }
     } catch (e) { console.error("[fixmi-weekly] reminder pass failed", e && e.message); }
 
-    const withReminders = (o) => ({ ...o, reminders: reminders ? { due: (reminders.due || []).length, sent: reminders.sent || 0, stamped: reminders.stamped || 0 } : null });
+    /* ---- what came back from yesterday's Monday page ----------------------
+       Answers land on the tickets silently all day; this is the one email that
+       reports them. It goes out the morning AFTER the summaries, because the
+       plan allows a single cron firing a day and that one is at 5am. Runs
+       before the day's own checks and never blocks them. */
+    let roundup = null;
+    try {
+      const want = DAYS.includes(String(wk.day || "").toLowerCase()) ? String(wk.day).toLowerCase() : "monday";
+      const dayAfter = DAYS[(DAYS.indexOf(want) + 1) % 7];
+      if (wk.on && now.day === dayAfter && wk.lastRoundupYmd !== now.ymd) {
+        roundup = await callNotify({ event: "mondayRoundup", _master: master,
+          since: Date.now() - 30 * 3600000 });
+        if (roundup && writePass) {
+          await fetch(masterUrl, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: writePass, updates: {
+              "admins/notifyPrefs/weekly": { ...wk, lastRoundupYmd: now.ymd } } }),
+          }).catch(() => {});
+        }
+        console.log("[fixmi-weekly] Monday roundup", JSON.stringify({ sent: (roundup || {}).sent, answers: (roundup || {}).answers }));
+      }
+    } catch (e) { console.error("[fixmi-weekly] roundup failed", e && e.message); }
+
+    const withReminders = (o) => ({ ...o, reminders: reminders ? { due: (reminders.due || []).length, sent: reminders.sent || 0, stamped: reminders.stamped || 0 } : null,
+      ...(roundup ? { roundup: { sent: roundup.sent || 0, answers: roundup.answers || 0 } } : {}) });
     if (!force) {
       if (!wk.on) return res.status(200).json(withReminders({ skipped: true, reason: "weekly summaries are switched off in Settings → Email" }));
       const want = DAYS.includes(String(wk.day || "").toLowerCase()) ? String(wk.day).toLowerCase() : "monday";
