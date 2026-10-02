@@ -503,25 +503,27 @@ function todayStamp() {
 
    answerButtons is kept for the one-off "send this person their summary"
    path and for links already sitting in somebody's inbox from last week. */
-function mondayButton(cfg, email, role) {
+/* `preview` is signed in alongside everything else. A preview page shows the
+   real tickets and the switches move, but nothing is written — which is what
+   makes "email myself a sample" safe to click. Tampering can only ever turn
+   preview ON (the safe direction); turning it off needs the secret. */
+function mondayLink(cfg, email, role, preview) {
   const w = cfg.stamp || todayStamp();
-  const q = new URLSearchParams({ e: lc(email), r: role, w,
-    s: require("crypto").createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
-        .update(`monday|${lc(email)}|${role}|${w}`).digest("hex").slice(0, 32) });
-  const url = `${String(cfg.selfUrl).replace(/\/$/, "")}/api/monday?${q}`;
+  const p = preview ? "1" : "";
+  const sig = require("crypto").createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
+    .update(`monday|${lc(email)}|${role}|${w}${p ? "|p" : ""}`).digest("hex").slice(0, 32);
+  const q = new URLSearchParams({ e: lc(email), r: role, w, ...(p ? { p } : {}), s: sig });
+  return `${String(cfg.selfUrl).replace(/\/$/, "")}/api/monday?${q}`;
+}
+function mondayButton(cfg, email, role, preview) {
+  const url = mondayLink(cfg, email, role, preview);
   return `<table role="presentation" cellspacing="0" cellpadding="0"><tr><td style="border-radius:9px;background:#1d76bb">
       <a href="${esc(url)}" target="_blank" style="display:inline-block;padding:14px 26px;color:#fff;
         text-decoration:none;font-weight:700;font-size:16px;border-radius:9px">Update these tickets &rarr;</a>
     </td></tr></table>
-    <div style="font-size:13px;color:#6b7280;margin-top:9px;line-height:1.5">
-      One page, one tap each — nothing opens a new tab and nobody gets emailed about your answers.</div>`;
-}
-function mondayLink(cfg, email, role) {
-  const w = cfg.stamp || todayStamp();
-  const q = new URLSearchParams({ e: lc(email), r: role, w,
-    s: require("crypto").createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
-        .update(`monday|${lc(email)}|${role}|${w}`).digest("hex").slice(0, 32) });
-  return `${String(cfg.selfUrl).replace(/\/$/, "")}/api/monday?${q}`;
+    <div style="font-size:13px;color:#6b7280;margin-top:9px;line-height:1.5">${preview
+      ? "This is a sample — the page opens, the switches move, and nothing is saved."
+      : "One page, one tap each — nothing opens a new tab and nobody gets emailed about your answers."}</div>`;
 }
 
 function answerButtons(cfg, ticketId, email, size, role) {
@@ -637,14 +639,13 @@ function summaryGM(master, person, cfg) {
           ${cat ? `<div style="font-size:13px;color:#6b7280;margin-top:5px">${esc(cat)}</div>` : ""}
           <div style="font-size:15px;line-height:1.5;margin-top:6px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
           <div style="font-size:12.5px;color:#6b7280;margin-top:7px">Opened ${esc(fmtDay(t.createdAt))} by ${esc(t.createdByName || t.createdBy || "someone")}${t.assigneeLabel ? ` · assigned to ${esc(t.assigneeLabel)}` : ""}</div>
-          <div style="margin-top:11px;font-size:12.5px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" target="_blank" style="color:#1d76bb">Open it in FixMi</a></div>
-          <div style="margin-top:9px;font-size:12px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" target="_blank" style="color:#1d76bb">Open it in FixMi</a></div>
+          <div style="margin-top:12px">${answerButtons(cfg, t._id, person.email, "", "gm")}</div>
+          <div style="margin-top:4px;font-size:12.5px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" target="_blank" style="color:#1d76bb">Open it in FixMi</a></div>
         </td></tr>
       </table></td></tr>`;
   }).join("");
   const text = [
     `${label} — ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`, "",
-    `Update them all here: ${mondayLink(cfg, person.email, "gm")}`, "",
     ...tickets.map(t => [
       `${t.shortId} · ${PRIORITY_LABEL[lc(t.priority)] || "Normal"} · ${STATUS_LABEL[t.status] || t.status} · open ${ageOf(t.createdAt)}`,
       t.description || "No description",
@@ -654,9 +655,8 @@ function summaryGM(master, person, cfg) {
   return {
     subject: summarySubject("gm", `${label}: ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`),
     html: shell(`${tickets.length} open at ${label}`,
-      "Tell us which of these are still a problem.",
-      `<tr><td style="padding:16px 24px 4px">${mondayButton(cfg, person.email, "gm")}</td></tr>
-       <tr><td style="height:10px"></td></tr>${rows}`),
+      "Tap Resolved or Unresolved on each one \u2014 the tab closes itself.",
+      rows),
     text,
   };
 }
@@ -688,20 +688,19 @@ function summaryDM(master, person, cfg) {
                 <!-- Without the issue itself a DM is being asked to mark
                      something resolved on the strength of its category. -->
                 <div style="font-size:14px;line-height:1.5;color:#111827;margin-top:4px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
+                <div style="margin-top:9px">${answerButtons(cfg, t._id, person.email, "sm", "dm")}</div>
                 </td></tr>`).join("")
           }</table>`
         : `<div style="font-size:13.5px;color:#059669;margin-top:6px">Nothing open.</div>`}
     </td></tr>`).join("");
   const text = [`${total} open across ${blocks.length} store${blocks.length === 1 ? "" : "s"}`, "",
-    `Update them all here: ${mondayLink(cfg, person.email, "dm")}`, "",
     ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n${storeUrlFor(app, b.sid)}\n` +
       (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}`).join("\n\n") : "  Nothing open.") + "\n")].join("\n");
   return {
     subject: summarySubject("dm", `${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`),
     html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
-      "Busiest store first. Marking one sorted moves it to Finished.",
-      `<tr><td style="padding:16px 24px 4px">${mondayButton(cfg, person.email, "dm")}</td></tr>
-       <tr><td style="height:10px"></td></tr>${rows}`),
+      "Busiest store first. Resolved comments and moves the ticket to Finished.",
+      rows),
     text,
   };
 }
@@ -1663,7 +1662,11 @@ function sampleAudience(master, kind, email, prefs, donePool) {
     p, n: p.kind === "tech" ? techTickets(master, p.techId).length
       : (p.kind === "gm" ? [p.storeId] : p.storeIds).reduce((n, sid) => n + openTicketsFor(master, sid).length, 0),
   })).sort((a, b) => b.n - a.n)[0];
-  if (busiest) return { ...busiest.p, email: lc(email), sample: true };
+  /* The summary is addressed to whoever asked for the test but built from a
+     real person's tickets, so keep both addresses: `email` is who receives it
+     (and who any button press is attributed to), `realEmail` is whose week it
+     actually is. */
+  if (busiest) return { ...busiest.p, email: lc(email), realEmail: busiest.p.email, sample: true };
   return null;
 }
 
@@ -1942,12 +1945,19 @@ module.exports = async (req, res) => {
        cron firing a day and that one is already used at 5am. */
     if (event === "mondayRoundup") {
       const prefs0 = prefsFrom(master);
-      const since = Number(body.since) || (Date.now() - 36 * 3600000);
+      /* The real run reports on the morning just gone. A preview or a sample
+         looks back over the whole week instead, so it is built from answers
+         that actually exist rather than coming out empty on a Thursday. */
+      const sample = body.mode === "preview" || body.mode === "test";
+      const since = Number(body.since) || (Date.now() - (sample ? 8 * 24 : 36) * 3600000);
       const stores = master.restaurants || {};
       const rows = [];
       Object.entries(master.maintenanceTickets || {}).forEach(([id, t]) => {
         arr(t && t.comments).forEach(c => {
-          if (!c || !c.monday || !c.ts || c.ts < since) return;
+          /* Either shape counts: a tap on the Resolved / Unresolved buttons
+             (answerKey) or the Monday page (monday). Links already sitting in
+             inboxes keep working, so both can arrive in the same week. */
+          if (!c || !(c.monday || c.answerKey) || !c.ts || c.ts < since) return;
           rows.push({ id, shortId: t.shortId || id, store: storeLabel(stores[t.storeId] || {}),
             who: c.by || c.email, answer: c.answer, desc: t.description || "", status: t.status, ts: c.ts });
         });
@@ -1963,6 +1973,20 @@ module.exports = async (req, res) => {
       const built = mondayRoundupBody(rows, quiet, cfg);
       const to = digestAudience(master, prefs0);
       if (body.mode === "preview") return res.status(200).json({ ok: true, preview: true, to, answers: rows.length, ...built });
+      /* mode "test" — the same email, built from the same real data, sent only
+         to you. It never touches the receipt list, so nobody else sees it. */
+      if (body.mode === "test") {
+        const known = knownAddresses(master, prefs0);
+        const mine = [...new Set(arr(body.to).map(lc).filter(e => e.includes("@")))].filter(e => known.has(e));
+        if (!mine.length) return res.status(400).json({ error: "the test address has to be someone FixMi already knows, or a test address from Settings → Email" });
+        if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+        const rt = await sendBatch(cfg, mine.map(addr => ({
+          From: `FixMi <${cfg.from}>`, To: addr, Subject: `[Sample] ${built.subject}`,
+          HtmlBody: built.html, TextBody: built.text,
+          MessageStream: cfg.stream, Tag: "monday-roundup", TrackOpens: false, TrackLinks: "None",
+        })));
+        return res.status(200).json({ ok: rt.ok, sent: rt.sent, to: mine, test: true, subject: built.subject, failed: rt.failed });
+      }
       if (!rows.length && !quiet.length) return res.status(200).json({ ok: true, sent: 0, reason: "nothing came back to report" });
       if (!to.length) return res.status(200).json({ ok: true, sent: 0, reason: "no receipt address is set" });
       if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
@@ -1988,7 +2012,7 @@ module.exports = async (req, res) => {
       /* A preview with no manifest behind it builds one from the people who
          WOULD be emailed on the next run, so what you are looking at is this
          Monday's receipt rather than a mock-up with invented names. */
-      if (body.mode === "preview" && !summaries.length) {
+      if ((body.mode === "preview" || body.mode === "test") && !summaries.length) {
         const dCfg = {
           appUrl: cfg.appUrl,
           selfUrl: (process.env.FIXMI_SELF_URL || `https://${req.headers.host || ""}`).replace(/\/$/, ""),
@@ -2020,6 +2044,20 @@ module.exports = async (req, res) => {
       });
       const to = digestAudience(master, prefs0);
       if (body.mode === "preview") return res.status(200).json({ ok: true, preview: true, to, ...built });
+      /* mode "test" — the same email, built from the same real data, sent only
+         to you. It never touches the receipt list, so nobody else sees it. */
+      if (body.mode === "test") {
+        const known = knownAddresses(master, prefs0);
+        const mine = [...new Set(arr(body.to).map(lc).filter(e => e.includes("@")))].filter(e => known.has(e));
+        if (!mine.length) return res.status(400).json({ error: "the test address has to be someone FixMi already knows, or a test address from Settings → Email" });
+        if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+        const rt = await sendBatch(cfg, mine.map(addr => ({
+          From: `FixMi <${cfg.from}>`, To: addr, Subject: `[Sample] ${built.subject}`,
+          HtmlBody: built.html, TextBody: built.text,
+          MessageStream: cfg.stream, Tag: "weekly-receipt", TrackOpens: false, TrackLinks: "None",
+        })));
+        return res.status(200).json({ ok: rt.ok, sent: rt.sent, to: mine, test: true, subject: built.subject, failed: rt.failed });
+      }
       if (!to.length) return res.status(200).json({ ok: true, sent: 0, reason: "no receipt address is set — add one in Settings → Email" });
       if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
       const r4 = await sendBatch(cfg, to.map(addr => ({
