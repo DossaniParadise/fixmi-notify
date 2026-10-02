@@ -495,6 +495,35 @@ function todayStamp() {
 }
 
 /** The pair of buttons that turn a summary line into a one-tap answer. */
+/* ---- the Monday link -----------------------------------------------------
+   One link for the whole email. It used to be a pair of buttons against every
+   ticket, which on a Monday morning meant a manager opening a tab per ticket
+   and each tab firing its own write. Now the whole round of answers happens on
+   one page, in one place, with the switches showing what they have said.
+
+   answerButtons is kept for the one-off "send this person their summary"
+   path and for links already sitting in somebody's inbox from last week. */
+function mondayButton(cfg, email, role) {
+  const w = cfg.stamp || todayStamp();
+  const q = new URLSearchParams({ e: lc(email), r: role, w,
+    s: require("crypto").createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
+        .update(`monday|${lc(email)}|${role}|${w}`).digest("hex").slice(0, 32) });
+  const url = `${String(cfg.selfUrl).replace(/\/$/, "")}/api/monday?${q}`;
+  return `<table role="presentation" cellspacing="0" cellpadding="0"><tr><td style="border-radius:9px;background:#1d76bb">
+      <a href="${esc(url)}" target="_blank" style="display:inline-block;padding:14px 26px;color:#fff;
+        text-decoration:none;font-weight:700;font-size:16px;border-radius:9px">Update these tickets &rarr;</a>
+    </td></tr></table>
+    <div style="font-size:13px;color:#6b7280;margin-top:9px;line-height:1.5">
+      One page, one tap each — nothing opens a new tab and nobody gets emailed about your answers.</div>`;
+}
+function mondayLink(cfg, email, role) {
+  const w = cfg.stamp || todayStamp();
+  const q = new URLSearchParams({ e: lc(email), r: role, w,
+    s: require("crypto").createHmac("sha256", process.env.FIXMI_SHARED_SECRET || "")
+        .update(`monday|${lc(email)}|${role}|${w}`).digest("hex").slice(0, 32) });
+  return `${String(cfg.selfUrl).replace(/\/$/, "")}/api/monday?${q}`;
+}
+
 function answerButtons(cfg, ticketId, email, size, role) {
   const w = cfg.stamp || todayStamp();
   const pad = size === "sm" ? "7px 15px" : "9px 22px";
@@ -608,27 +637,26 @@ function summaryGM(master, person, cfg) {
           ${cat ? `<div style="font-size:13px;color:#6b7280;margin-top:5px">${esc(cat)}</div>` : ""}
           <div style="font-size:15px;line-height:1.5;margin-top:6px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
           <div style="font-size:12.5px;color:#6b7280;margin-top:7px">Opened ${esc(fmtDay(t.createdAt))} by ${esc(t.createdByName || t.createdBy || "someone")}${t.assigneeLabel ? ` · assigned to ${esc(t.assigneeLabel)}` : ""}</div>
-          <div style="margin-top:13px;font-size:13px;color:#6b7280">Still a problem?</div>
-          <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, null, "gm")}</div>
+          <div style="margin-top:11px;font-size:12.5px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" target="_blank" style="color:#1d76bb">Open it in FixMi</a></div>
           <div style="margin-top:9px;font-size:12px"><a href="${esc(ticketUrlFor(cfg.appUrl, t))}" target="_blank" style="color:#1d76bb">Open it in FixMi</a></div>
         </td></tr>
       </table></td></tr>`;
   }).join("");
   const text = [
     `${label} — ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`, "",
+    `Update them all here: ${mondayLink(cfg, person.email, "gm")}`, "",
     ...tickets.map(t => [
       `${t.shortId} · ${PRIORITY_LABEL[lc(t.priority)] || "Normal"} · ${STATUS_LABEL[t.status] || t.status} · open ${ageOf(t.createdAt)}`,
       t.description || "No description",
-      `UNRESOLVED: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp, "gm")}`,
-      `                  RESOLVED:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp, "gm")}`,
       "",
     ].join("\n")),
   ].join("\n");
   return {
     subject: summarySubject("gm", `${label}: ${tickets.length} open ticket${tickets.length === 1 ? "" : "s"}`),
     html: shell(`${tickets.length} open at ${label}`,
-      "Either answer leaves a note on the ticket.",
-      `<tr><td style="height:10px"></td></tr>${rows}`),
+      "Tell us which of these are still a problem.",
+      `<tr><td style="padding:16px 24px 4px">${mondayButton(cfg, person.email, "gm")}</td></tr>
+       <tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
 }
@@ -660,18 +688,20 @@ function summaryDM(master, person, cfg) {
                 <!-- Without the issue itself a DM is being asked to mark
                      something resolved on the strength of its category. -->
                 <div style="font-size:14px;line-height:1.5;color:#111827;margin-top:4px;white-space:pre-wrap">${esc(t.description || "No description")}</div>
-                <div style="margin-top:8px">${answerButtons(cfg, t._id, person.email, "sm", "dm")}</div></td></tr>`).join("")
+                </td></tr>`).join("")
           }</table>`
         : `<div style="font-size:13.5px;color:#059669;margin-top:6px">Nothing open.</div>`}
     </td></tr>`).join("");
   const text = [`${total} open across ${blocks.length} store${blocks.length === 1 ? "" : "s"}`, "",
+    `Update them all here: ${mondayLink(cfg, person.email, "dm")}`, "",
     ...blocks.map(b => `${b.label} — ${b.tickets.length} open\n${storeUrlFor(app, b.sid)}\n` +
-      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}\n  Unresolved: ${answerUrl(cfg.selfUrl, t._id, "unresolved", person.email, cfg.stamp, "dm")}\n  Resolved:   ${answerUrl(cfg.selfUrl, t._id, "resolved", person.email, cfg.stamp, "dm")}`).join("\n\n") : "  Nothing open.") + "\n")].join("\n");
+      (b.tickets.length ? b.tickets.map(t => `  ${t.shortId} — ${t.categoryLabel || t.category || "Ticket"} (${PRIORITY_LABEL[lc(t.priority)] || "Normal"}, ${STATUS_LABEL[t.status] || t.status}, ${ageOf(t.createdAt)})\n  ${(t.description || "No description").replace(/\n/g, "\n  ")}\n  ${ticketUrlFor(app, t)}`).join("\n\n") : "  Nothing open.") + "\n")].join("\n");
   return {
     subject: summarySubject("dm", `${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`),
     html: shell(`${total} open across your ${blocks.length} store${blocks.length === 1 ? "" : "s"}`,
-      "Busiest store first. Resolved moves a ticket to Finished; Unresolved notes it.",
-      `<tr><td style="height:10px"></td></tr>${rows}`),
+      "Busiest store first. Marking one sorted moves it to Finished.",
+      `<tr><td style="padding:16px 24px 4px">${mondayButton(cfg, person.email, "dm")}</td></tr>
+       <tr><td style="height:10px"></td></tr>${rows}`),
     text,
   };
 }
@@ -1309,6 +1339,43 @@ function summaryVP(master, person, cfg) {
   };
 }
 
+/** What the Monday page collected, and who never opened it. */
+function mondayRoundupBody(rows, quiet, cfg) {
+  const fixed = rows.filter(r => r.answer === "resolved");
+  const broke = rows.filter(r => r.answer === "unresolved");
+  const line = r => `<tr>
+    <td style="padding:8px 10px 8px 0;font-size:13.5px;border-bottom:1px solid #f3f4f6;vertical-align:top">
+      <b>${esc(r.store)}</b> <span style="color:#9ca3af">${esc(r.shortId)}</span>
+      <div style="color:#4b5563;margin-top:2px">${esc(r.desc)}</div></td>
+    <td style="padding:8px 0;text-align:right;font-size:12px;white-space:nowrap;border-bottom:1px solid #f3f4f6;vertical-align:top">
+      ${esc(r.who || "")}<div style="color:#9ca3af;margin-top:2px">${esc(STATUS_LABEL[r.status] || r.status)}</div></td></tr>`;
+  const group = (title, list, colour) => list.length ? `
+    <tr><td style="padding:17px 24px 3px;font-size:12px;font-weight:700;color:${colour};text-transform:uppercase;letter-spacing:.06em">
+      ${esc(title)} · ${list.length}</td></tr>
+    <tr><td style="padding:2px 24px 0"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">${list.map(line).join("")}</table></td></tr>` : "";
+  const inner = `<tr><td style="padding:14px 19px 4px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
+      ${statTile(rows.length, "answers back", "#111827")}
+      ${statTile(broke.length, "still broken", broke.length ? SEV.emergency.fill : "#9ca3af")}
+      ${statTile(fixed.length, "sorted", fixed.length ? SEV.normal.fill : "#9ca3af")}
+    </tr></table></td></tr>`
+    + group("Still broken", broke, "#c81e1e")
+    + group("Marked sorted", fixed, "#047857")
+    + (quiet.length ? `<tr><td style="padding:17px 24px 20px;font-size:12.5px;color:#6b7280;line-height:1.6">
+        <b style="color:#b45309">Never opened their link (${quiet.length}):</b> ${quiet.map(q => esc(q.name)).join(" · ")}</td></tr>`
+      : `<tr><td style="padding:14px 24px 20px;font-size:12.5px;color:#059669"><b>Everybody answered.</b></td></tr>`);
+  const text = [
+    `${rows.length} answer${rows.length === 1 ? "" : "s"} came back — ${broke.length} still broken, ${fixed.length} sorted`, "",
+    ...(broke.length ? ["STILL BROKEN", ...broke.map(r => `  ${r.store} ${r.shortId} — ${r.desc}  (${r.who})`), ""] : []),
+    ...(fixed.length ? ["MARKED SORTED", ...fixed.map(r => `  ${r.store} ${r.shortId} — ${r.desc}  (${r.who})`), ""] : []),
+    quiet.length ? `NEVER OPENED THEIR LINK (${quiet.length})\n` + quiet.map(q => "  " + q.name).join("\n") : "Everybody answered.",
+  ].join("\n");
+  return {
+    subject: `FixMi Monday Results — ${broke.length} still broken, ${fixed.length} sorted${quiet.length ? `, ${quiet.length} no reply` : ""}`,
+    html: shell(`${rows.length} answer${rows.length === 1 ? "" : "s"} came back`, "", inner, "Monday results"),
+    text,
+  };
+}
+
 /* ════════════════════════════════════════════════════════════════════════════
    THE MONDAY RECEIPT
 
@@ -1615,7 +1682,7 @@ module.exports = async (req, res) => {
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
     if (secret !== want) return res.status(401).json({ error: "bad secret" });
-    const DIAG = ["selftest", "sendtest", "postmark", "summary", "reminders", "digest"];
+    const DIAG = ["selftest", "sendtest", "postmark", "summary", "reminders", "digest", "mondayRoundup"];
     if (!EVENTS.includes(event) && !DIAG.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
     if (!ticketId && !DIAG.includes(event)) return res.status(400).json({ error: "ticketId is required" });
 
@@ -1664,7 +1731,8 @@ module.exports = async (req, res) => {
           return { status: r2.status };
         } catch (e) { return { status: 0, error: (e && e.message) || String(e) }; }
       };
-      const [answerProbe, weeklyProbe] = await Promise.all([probe("/api/answer"), probe("/api/weekly")]);
+      const [answerProbe, weeklyProbe, mondayProbe] = await Promise.all([
+        probe("/api/answer"), probe("/api/weekly"), probe("/api/monday")]);
       const wk = ((master.admins || {}).notifyPrefs || {}).weekly || {};
 
       const out = {
@@ -1672,7 +1740,7 @@ module.exports = async (req, res) => {
         tokenPresent: !!cfg.token,
         selfUrl: self,
         selfUrlSet: !!process.env.FIXMI_SELF_URL,
-        endpoints: { answer: answerProbe, weekly: weeklyProbe },
+        endpoints: { answer: answerProbe, weekly: weeklyProbe, monday: mondayProbe },
         weekly: {
           on: !!wk.on,
           day: wk.day || "monday",
@@ -1864,6 +1932,47 @@ module.exports = async (req, res) => {
       });
       console.log("[fixmi-notify] weekly summaries", { testMode: prefs0.testMode, built: log.length, sent: r3.sent });
       return res.status(200).json({ ok: r3.ok, sent: r3.sent, testMode: prefs0.testMode, people: log, failed: r3.failed, manifest });
+    }
+
+    /* ---- WHAT CAME BACK FROM THE MONDAY PAGE -------------------------------
+       Answers land silently on the tickets all day; this is the one email that
+       says what happened. It reads the tickets rather than any separate log,
+       so it is always true even if somebody answered twice or changed their
+       mind. Sent by the clock the morning after, because the plan allows one
+       cron firing a day and that one is already used at 5am. */
+    if (event === "mondayRoundup") {
+      const prefs0 = prefsFrom(master);
+      const since = Number(body.since) || (Date.now() - 36 * 3600000);
+      const stores = master.restaurants || {};
+      const rows = [];
+      Object.entries(master.maintenanceTickets || {}).forEach(([id, t]) => {
+        arr(t && t.comments).forEach(c => {
+          if (!c || !c.monday || !c.ts || c.ts < since) return;
+          rows.push({ id, shortId: t.shortId || id, store: storeLabel(stores[t.storeId] || {}),
+            who: c.by || c.email, answer: c.answer, desc: t.description || "", status: t.status, ts: c.ts });
+        });
+      });
+      /* Who was asked but never opened their link — the useful half of this
+         report, because a silent store is the one nobody has checked. */
+      const asked = [];
+      ["gm", "dm"].forEach(k => summaryAudience(master, k, prefs0).forEach(p0 => {
+        const theirs = rows.filter(r => lc(r.who) === lc(p0.name) || lc(r.who) === lc(p0.email));
+        asked.push({ kind: k, name: p0.name, email: p0.email, n: theirs.length });
+      }));
+      const quiet = asked.filter(a => !a.n);
+      const built = mondayRoundupBody(rows, quiet, cfg);
+      const to = digestAudience(master, prefs0);
+      if (body.mode === "preview") return res.status(200).json({ ok: true, preview: true, to, answers: rows.length, ...built });
+      if (!rows.length && !quiet.length) return res.status(200).json({ ok: true, sent: 0, reason: "nothing came back to report" });
+      if (!to.length) return res.status(200).json({ ok: true, sent: 0, reason: "no receipt address is set" });
+      if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+      const r5 = await sendBatch(cfg, to.map(addr => ({
+        From: `FixMi <${cfg.from}>`, To: addr, Subject: built.subject,
+        HtmlBody: built.html, TextBody: built.text,
+        MessageStream: cfg.stream, Tag: "monday-roundup", TrackOpens: false, TrackLinks: "None",
+      })));
+      console.log("[fixmi-notify] Monday roundup →", to.join(", "), rows.length, "answers");
+      return res.status(200).json({ ok: r5.ok, sent: r5.sent, to, answers: rows.length, quiet: quiet.length, failed: r5.failed });
     }
 
     /* ---- THE RECEIPT -------------------------------------------------------
