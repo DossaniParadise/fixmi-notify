@@ -89,7 +89,27 @@ async function readMaster(url) {
   return (r && r.ok) ? r : fetch(url, opts);
 }
 
-function page({ title, line, tone, link }) {
+/* A Monday morning means one of these tabs per ticket, so a page that has
+   finished its job tries to get out of the way.
+
+   Honest about the limits: a browser only lets a page close itself when a
+   script opened it. A tab opened by tapping a link in Mail or Gmail usually
+   qualifies on iOS and in the Gmail app, and usually does NOT in desktop
+   Chrome, which strips the opener. So it tries, and a moment later, if it is
+   still here, it says plainly that it is safe to close — never a spinner that
+   hangs forever on the browsers that refuse. */
+function autoCloseScript() {
+  return `<script>
+    setTimeout(function(){
+      try{window.close()}catch(e){}
+      setTimeout(function(){
+        var n=document.getElementById("cl");
+        if(n){n.textContent="Saved. You can close this tab.";n.style.opacity="1"}
+      },500);
+    },1100);
+  <\/script>`;
+}
+function page({ title, line, tone, link, autoClose }) {
   const colour = tone === "bad" ? "#e8091b" : tone === "warn" ? "#b45309" : "#059669";
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title></head>
@@ -100,10 +120,11 @@ function page({ title, line, tone, link }) {
       ${tone === "bad" ? "!" : "&#10003;"}</div>
     <h1 style="font-size:20px;margin:18px 0 8px">${esc(title)}</h1>
     <p style="font-size:15px;line-height:1.55;color:#4b5563;margin:0">${esc(line)}</p>
+    ${autoClose ? `<p id="cl" style="font-size:13.5px;color:#6b7280;margin:14px 0 0;opacity:.75">Closing this tab\u2026</p>` : ""}
     ${link ? `<a href="${esc(link)}" style="display:inline-block;margin-top:20px;background:#1d76bb;color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:11px 20px;border-radius:9px">Open the ticket in FixMi</a>` : ""}
   </div>
   <p style="text-align:center;font-size:12px;color:#9ca3af;margin-top:16px">Dossani Paradise · FixMi</p>
-</div></body></html>`;
+</div>${autoClose ? autoCloseScript() : ""}</body></html>`;
 }
 
 module.exports = async (req, res) => {
@@ -160,7 +181,7 @@ module.exports = async (req, res) => {
       return html(200, {
         title: `Already noted — ${answer}`,
         line: `Your answer was recorded on ${ticket.shortId || "this ticket"} and everyone on it has been told. Nothing more to do.`,
-        link: url,
+        link: url, autoClose: true,
       });
     }
 
@@ -215,7 +236,7 @@ module.exports = async (req, res) => {
 
     console.log("[fixmi-answer]", ticket.shortId || ticketId, answer, "from", email, `(${linkRole})`, moved ? "→ finished" : "comment only");
     const shortId = ticket.shortId || "this ticket";
-    return html(200, { title: spec.title, line: (moved && spec.movedLine ? spec.movedLine : spec.line)(shortId), link: url });
+    return html(200, { title: spec.title, line: (moved && spec.movedLine ? spec.movedLine : spec.line)(shortId), link: url, autoClose: true });
   } catch (e) {
     console.error("[fixmi-answer] crashed", e);
     return html(500, { title: "Something went wrong", line: "Please open the ticket in FixMi and leave a comment there instead.", tone: "bad" });
