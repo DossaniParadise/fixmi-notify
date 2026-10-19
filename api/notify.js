@@ -188,7 +188,7 @@ function recipientsFor(master, ticket, opts) {
     const dm = (master.areaCoaches || {})[id];
     if (dm) put(dm.email, dm.name, "District Manager", "dm");
   });
-  put(store.email, store.storeManager || store.storeName, "General Manager", "gm");
+  put(store.email, managerName(store) || store.storeName, "General Manager", "gm");
   const tech = (master.repairTechnicians || {})[ticket.assignedTechId];
   if (tech) put(tech.email, tech.name, "Assigned tech", "tech");
   /* A DM the ticket has been handed to is already in the list as a District
@@ -218,6 +218,34 @@ function recipientsFor(master, ticket, opts) {
    Bonham"), and some storeNumber values arrive with a "#" already on them.
    Naming a store in one place stops subjects like "Store ##11460 — Burger
    King #11460 Bonham". */
+/* ---- who manages this store -----------------------------------------------
+   FindMi moved to a LIST of managers per store — {name, title, phone} — and
+   keeps storeManager / assistantManager only as legacy fields for stores it
+   has not imported yet. Its importer writes `managers` and deliberately
+   leaves the old fields alone, so on an imported store `storeManager` is
+   frozen at whoever had the job before.
+
+   Same precedence FindMi's own storeManagersOf() uses. Nothing is written
+   back — two writable copies of one fact is what caused this. */
+function managerList(store) {
+  const s = store || {};
+  const raw = Array.isArray(s.managers) ? s.managers
+    : (s.managers && typeof s.managers === "object" ? Object.values(s.managers) : []);
+  const list = raw.filter(m => m && String(m.name || "").trim())
+    .map(m => ({ name: String(m.name).trim(), title: String(m.title || "").trim() }));
+  if (list.length) return list;
+  const out = [];
+  if (String(s.storeManager || "").trim()) out.push({ name: String(s.storeManager).trim(), title: "GM" });
+  if (String(s.assistantManager || "").trim()) out.push({ name: String(s.assistantManager).trim(), title: "AGM" });
+  return out;
+}
+/* The GM by preference — a store can list an AGM and other contacts, and these
+   emails are addressed to whoever runs the place. */
+function managerName(store) {
+  const l = managerList(store);
+  const gm = l.find(m => m.title.toUpperCase() === "GM");
+  return (gm || l[0] || {}).name || "";
+}
 function storeLabel(store) {
   const name = String(store.storeName || "Store").trim();
   const num = String(store.storeNumber || "").replace(/^#+/, "").trim();
@@ -1540,7 +1568,7 @@ function reminderPeople(master, ticket, rule, prefs) {
     const dm = (master.areaCoaches || {})[cid];
     if (dm) put("dm", dm.email, dm.name, "District Manager");
   });
-  put("gm", store.email, store.storeManager || store.storeName, "General Manager");
+  put("gm", store.email, managerName(store) || store.storeName, "General Manager");
   const tech = (master.repairTechnicians || {})[ticket.assignedTechId];
   if (tech) put("tech", tech.email, tech.name, "Assigned tech");
   const owner = (master.areaCoaches || {})[ticket.assignedCoachId];
@@ -1602,7 +1630,7 @@ function summaryAudience(master, kind, prefs, donePool) {
   const out = [];
   if (kind === "gm") {
     Object.entries(stores).forEach(([sid, st]) => {
-      if (lc(st.email).includes("@") && !optedOut(st.email)) out.push({ kind, email: lc(st.email), name: st.storeManager || storeLabel(st), storeId: sid, store: st });
+      if (lc(st.email).includes("@") && !optedOut(st.email)) out.push({ kind, email: lc(st.email), name: managerName(st) || storeLabel(st), storeId: sid, store: st });
     });
   } else if (kind === "dm") {
     Object.entries(master.areaCoaches || {}).forEach(([id, c]) => {
