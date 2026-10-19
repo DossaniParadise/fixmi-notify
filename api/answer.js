@@ -127,6 +127,35 @@ function page({ title, line, tone, link, autoClose }) {
 </div>${autoClose ? autoCloseScript() : ""}</body></html>`;
 }
 
+/* ---- who manages this store -----------------------------------------------
+   FindMi moved to a LIST of managers per store — {name, title, phone} — and
+   keeps storeManager / assistantManager only as legacy fields for stores it
+   has not imported yet. Its importer writes `managers` and deliberately
+   leaves the old fields alone, so on an imported store `storeManager` is
+   frozen at whoever had the job before.
+
+   Same precedence FindMi's own storeManagersOf() uses. Nothing is written
+   back — two writable copies of one fact is what caused this. */
+function managerList(store) {
+  const s = store || {};
+  const raw = Array.isArray(s.managers) ? s.managers
+    : (s.managers && typeof s.managers === "object" ? Object.values(s.managers) : []);
+  const list = raw.filter(m => m && String(m.name || "").trim())
+    .map(m => ({ name: String(m.name).trim(), title: String(m.title || "").trim() }));
+  if (list.length) return list;
+  const out = [];
+  if (String(s.storeManager || "").trim()) out.push({ name: String(s.storeManager).trim(), title: "GM" });
+  if (String(s.assistantManager || "").trim()) out.push({ name: String(s.assistantManager).trim(), title: "AGM" });
+  return out;
+}
+/* The GM by preference — a store can list an AGM and other contacts, and these
+   emails are addressed to whoever runs the place. */
+function managerName(store) {
+  const l = managerList(store);
+  const gm = l.find(m => m.title.toUpperCase() === "GM");
+  return (gm || l[0] || {}).name || "";
+}
+
 module.exports = async (req, res) => {
   const html = (code, opts) => {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -169,7 +198,7 @@ module.exports = async (req, res) => {
     /* Who is answering. The address was signed into the link, so this is the
        person the summary was addressed to, not whoever forwarded it. */
     const store = (master.restaurants || {})[ticket.storeId] || {};
-    let by = store.storeManager || store.storeName || email, role = "manager";
+    let by = managerName(store) || store.storeName || email, role = "manager";
     [["admins", "admin"], ["directors", "director"], ["areaCoaches", "coach"], ["repairTechnicians", "tech"]].forEach(([g, rl]) => {
       Object.values(master[g] || {}).forEach(o => { if (o && lc(o.email) === email) { by = o.name || by; role = rl; } });
     });
