@@ -273,7 +273,7 @@ function identify(master, email) {
   const want = lc(email);
   const look = (group, role) => {
     for (const o of Object.values(master[group] || {})) {
-      if (o && lc(o.email) === want) return { name: o.name || o.storeManager || want, role };
+      if (o && lc(o.email) === want) return { name: o.name || managerName(o) || want, role };
     }
     return null;
   };
@@ -450,6 +450,35 @@ async function callNotify(payload, req) {
     console.error("[fixmi-inbound] comment saved but the notification failed", e && e.message);
     return null;
   }
+}
+
+/* ---- who manages this store -----------------------------------------------
+   FindMi moved to a LIST of managers per store — {name, title, phone} — and
+   keeps storeManager / assistantManager only as legacy fields for stores it
+   has not imported yet. Its importer writes `managers` and deliberately
+   leaves the old fields alone, so on an imported store `storeManager` is
+   frozen at whoever had the job before.
+
+   Same precedence FindMi's own storeManagersOf() uses. Nothing is written
+   back — two writable copies of one fact is what caused this. */
+function managerList(store) {
+  const s = store || {};
+  const raw = Array.isArray(s.managers) ? s.managers
+    : (s.managers && typeof s.managers === "object" ? Object.values(s.managers) : []);
+  const list = raw.filter(m => m && String(m.name || "").trim())
+    .map(m => ({ name: String(m.name).trim(), title: String(m.title || "").trim() }));
+  if (list.length) return list;
+  const out = [];
+  if (String(s.storeManager || "").trim()) out.push({ name: String(s.storeManager).trim(), title: "GM" });
+  if (String(s.assistantManager || "").trim()) out.push({ name: String(s.assistantManager).trim(), title: "AGM" });
+  return out;
+}
+/* The GM by preference — a store can list an AGM and other contacts, and these
+   emails are addressed to whoever runs the place. */
+function managerName(store) {
+  const l = managerList(store);
+  const gm = l.find(m => m.title.toUpperCase() === "GM");
+  return (gm || l[0] || {}).name || "";
 }
 
 module.exports = async (req, res) => {
