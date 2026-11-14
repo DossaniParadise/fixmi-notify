@@ -1190,102 +1190,180 @@ function techDoneAt(t) {
   return Number(t.finishedAt) || Number(t.closedAt) || Number(t.updatedAt) || 0;
 }
 const COMPLETION_DAYS = 7;
-/** This technician's finished and closed tickets from the last seven days. */
-function completionRows(pool, techId, nowTs) {
-  const to = nowTs || Date.now(), from = to - COMPLETION_DAYS * 86400000;
-  return Object.entries(pool || {})
-    .filter(([, t]) => t && t.assignedTechId === techId && DONE_STATUSES.includes(lc(t.status)))
-    .map(([id, t]) => ({ ...t, _id: t._id || id, _doneAt: techDoneAt(t) }))
-    .filter(t => t._doneAt >= from && t._doneAt <= to)
-    .sort((a, b) => b._doneAt - a._doneAt);
-}
-/* Category as the app shows it. The stored ticket carries only keys, so the
-   labels come from the category editor's saved lists when there are any and
-   from tidying the key when there are not. */
-function categoryLabels(master) {
-  const cats = {}, subs = {};
-  const stored = (master.admins || {}).divisionCategories;
-  if (stored && typeof stored === "object") {
-    Object.values(stored).forEach(list => arr(list).forEach(c => {
-      if (!c || !c.key) return;
-      if (c.label) cats[c.key] = c.label;
-      arr(c.subs).forEach(sb => { if (sb && sb.key && sb.label) subs[sb.key] = sb.label; });
-    }));
+
+/* ---- the week, one calendar day at a time ---------------------------------
+   The reader is an executive asking two things at a glance: were they working
+   all week, and where were they. So the report is laid out by DAY, the empty
+   days stay on the page (a gap is the answer), and each job is reduced to its
+   category and its store — the ticket is one tap away for anyone who wants
+   the rest.
+
+   Days are Central calendar days, counted on the calendar rather than in
+   24-hour steps so a clock change cannot drop or double a day. Sent on a
+   Sunday night the seven days are exactly Monday to Sunday. */
+const ymdCentral = ts => {
+  const f = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Chicago", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(Number(ts)));
+  const g = t => (f.find(x => x.type === t) || {}).value || "";
+  return `${g("year")}-${g("month")}-${g("day")}`;
+};
+function lastDays(nowTs, n) {
+  const [y, m, d] = ymdCentral(nowTs || Date.now()).split("-").map(Number);
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const dt = new Date(Date.UTC(y, m - 1, d - i, 12));
+    out.push({
+      ymd: dt.toISOString().slice(0, 10),
+      dow: dt.toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short" }),
+      long: dt.toLocaleDateString("en-US", { timeZone: "UTC", weekday: "long" }),
+      date: dt.toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" }),
+    });
   }
-  return { cats, subs };
+  return out;
 }
-function categoryPath(t, labels) {
-  const fromApp = String(t.categoryLabel || "").trim();
-  if (fromApp) return fromApp.replace(/\s*[\u2192>|]\s*/g, " \u203a ");
-  const ck = String(t.category || "").trim(), sk = String(t.subcategory || "").trim();
-  if (!ck) return "Other";
-  const c = (labels.cats[ck]) || titleCat(ck);
-  if (!sk) return c;
-  /* Item keys are stored as "<category>_<item>"; without a saved label the
-     category half would otherwise be said twice. */
-  const bare = sk.toLowerCase().startsWith(ck.toLowerCase() + "_") ? sk.slice(ck.length + 1) : sk;
-  return `${c} \u203a ${labels.subs[sk] || titleCat(bare)}`;
-}
-const shortDay = ts => new Date(Number(ts)).toLocaleDateString("en-US", { timeZone: "America/Chicago", weekday: "short", month: "short", day: "numeric" });
-const rangeDay = ts => new Date(Number(ts)).toLocaleDateString("en-US", { timeZone: "America/Chicago", month: "short", day: "numeric" });
 
-function completionBody(master, tech, rows, cfg, nowTs) {
-  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
+/* ---- the mileage estimate --------------------------------------------------
+   There is no odometer and no GPS trail behind this — only the stores, and
+   the order the technician was at them. So it is the straight-line distance
+   from each stop to the next within a day, times 1.3, which is about what
+   roads add to a straight line across a metro area. It leaves out the drive
+   from home in the morning and back at night, because FixMi does not know
+   where home is. Good enough to tell a week spent at one store from a week
+   spent crossing the district; not an expense claim. */
+const ROAD_FACTOR = 1.3;
+function milesBetween(a, b) {
+  const R = 3958.8, dLat = (b.lat - a.lat) * DEG, dLng = (b.lng - a.lng) * DEG;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * DEG) * Math.cos(b.lat * DEG) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+/* What puts a technician AT a store: starting a job, finishing one, or moving
+   its status themselves. Somebody else re-routing their ticket does not. */
+const ON_SITE_ACTIONS = ["clockin", "clockout", "status"];
+
+/** One technician's last seven days: jobs done, where they were, how far. */
+function completionWeek(master, pool, techId, nowTs) {
   const stores = master.restaurants || {};
-  const labels = categoryLabels(master);
-  const to = nowTs || Date.now(), from = to - COMPLETION_DAYS * 86400000;
-  const range = `${rangeDay(from)} \u2013 ${rangeDay(to)}`;
-  const name = tech.name || "Technician";
-  const n = rows.length;
-
-  // Grouped by store: that is how a week of site visits actually reads.
-  const groups = [];
-  const seen = new Map();
-  rows.forEach(t => {
-    let g = seen.get(t.storeId);
-    if (!g) { g = { sid: t.storeId, label: storeLabel(stores[t.storeId] || {}), rows: [] }; seen.set(t.storeId, g); groups.push(g); }
-    g.rows.push(t);
+  const days = lastDays(nowTs, COMPLETION_DAYS).map(d => ({ ...d, jobs: [], visits: [] }));
+  const byYmd = new Map(days.map(d => [d.ymd, d]));
+  Object.entries(pool || {}).forEach(([id, t0]) => {
+    if (!t0 || t0.assignedTechId !== techId) return;
+    const t = { ...t0, _id: t0._id || id };
+    if (DONE_STATUSES.includes(lc(t.status))) {
+      const at = techDoneAt(t), day = byYmd.get(ymdCentral(at));
+      if (day) { day.jobs.push({ ...t, _doneAt: at }); day.visits.push({ ts: at, storeId: t.storeId, t }); }
+    }
+    /* Work that did not end in a finished job still happened. Without this a
+       day spent on something now waiting on a part would read as a day off —
+       the wrong answer to the very question this report exists for. */
+    arr(t.activity).forEach(a => {
+      if (!a || !a.ts || lc(a.role) !== "tech" || !ON_SITE_ACTIONS.includes(lc(a.action))) return;
+      const day = byYmd.get(ymdCentral(a.ts));
+      if (day) day.visits.push({ ts: Number(a.ts), storeId: t.storeId, t });
+    });
   });
-  groups.sort((a, b) => b.rows.length - a.rows.length || a.label.localeCompare(b.label));
+  let jobs = 0, miles = 0, noGps = 0, worked = 0;
+  const allStores = new Set();
+  days.forEach(d => {
+    d.jobs.sort((a, b) => a._doneAt - b._doneAt);
+    d.visits.sort((a, b) => a.ts - b.ts);
+    // Stops in the order they happened; back-to-back entries at one store are one stop.
+    const stops = [];
+    d.visits.forEach(v => { if (!stops.length || stops[stops.length - 1] !== v.storeId) stops.push(v.storeId); });
+    d.miles = 0; d.noGps = 0;
+    for (let i = 1; i < stops.length; i++) {
+      const a = storePoint(stores[stops[i - 1]]), b = storePoint(stores[stops[i]]);
+      if (a && b) d.miles += milesBetween(a, b) * ROAD_FACTOR; else d.noGps++;
+    }
+    // Stores in the order first reached, each with the jobs finished there.
+    const order = [...new Set(d.visits.map(v => v.storeId))];
+    d.stores = order.map(sid => ({
+      sid, label: storeLabel(stores[sid] || {}),
+      jobs: d.jobs.filter(j => j.storeId === sid),
+      any: (d.visits.find(v => v.storeId === sid) || {}).t,
+    }));
+    d.worked = d.visits.length > 0;
+    jobs += d.jobs.length; miles += d.miles; noGps += d.noGps; if (d.worked) worked++;
+    order.forEach(sid => allStores.add(sid));
+  });
+  return { days, jobs, miles, noGps, worked, stores: allStores.size };
+}
+const mi = n => n >= 0.5 ? `≈ ${Math.round(n)} mi` : "";
 
-  const subject = `FixMi Completion Report \u2014 ${name}: ${n} job${n === 1 ? "" : "s"} completed, ${range}`;
-  const title = `${name} \u2014 ${n} job${n === 1 ? "" : "s"} completed`;
-  const subtitle = n
-    ? `${range} \u00b7 ${groups.length} store${groups.length === 1 ? "" : "s"} \u00b7 tap any job to open the full ticket`
-    : range;
+function completionBody(master, tech, week, cfg) {
+  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
+  const name = tech.name || "Technician";
+  const { days, jobs: n, worked } = week;
+  const range = `${days[0].dow}, ${days[0].date} – ${days[days.length - 1].dow}, ${days[days.length - 1].date}`;
+  const milesTxt = mi(week.miles) || "0 mi";
+  const cat = t => topCategory(t);
+  const plural = (k, w) => `${k} ${w}${k === 1 ? "" : "s"}`;
 
-  const line = t => `<tr><td style="padding:0 0 6px">
-      <a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="display:block;text-decoration:none;color:#111827;
-         border:1px solid #e5e7eb;border-left:4px solid #047857;border-radius:9px;padding:11px 14px">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
-          <td style="font-size:15px;font-weight:700;line-height:1.35;color:#111827">${esc(categoryPath(t, labels))}</td>
-          <td style="font-size:12.5px;color:#6b7280;text-align:right;white-space:nowrap;padding-left:10px" valign="top">${esc(shortDay(t._doneAt))}</td>
+  const subject = `FixMi Completion Report — ${name}: ${plural(n, "job")}, worked ${worked} of ${days.length} days, ${milesTxt} (${days[0].date} – ${days[days.length - 1].date})`;
+
+  // ---- the four numbers --------------------------------------------------
+  const tile = (big, label) => `<td width="25%" style="padding:0 4px" valign="top">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f9fafb;border:1px solid #eef0f3;border-radius:9px"><tr>
+        <td style="padding:10px 6px;text-align:center">
+          <div style="font-size:20px;font-weight:800;line-height:1.1;white-space:nowrap">${big}</div>
+          <div style="font-size:10.5px;color:#6b7280;margin-top:3px;text-transform:uppercase;letter-spacing:.05em">${label}</div>
+        </td></tr></table></td>`;
+  const tiles = `<tr><td style="padding:14px 20px 0"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed"><tr>
+      ${tile(n, "Jobs done")}${tile(`${worked}<span style="font-size:14px;color:#6b7280;font-weight:700"> / ${days.length}</span>`, "Days worked")}${tile(week.stores, week.stores === 1 ? "Store" : "Stores")}${tile(`${Math.round(week.miles)}<span style="font-size:13px;color:#6b7280;font-weight:700"> mi</span>`, "Est. driving")}
+    </tr></table></td></tr>`;
+
+  // ---- the week in one row: the answer to "were they working all week" ---
+  const strip = `<tr><td style="padding:10px 20px 0"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed"><tr>${
+    days.map(d => {
+      const on = d.worked;
+      return `<td style="padding:0 2px" valign="top"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+          style="background:${on ? "#ecfdf5" : "#f9fafb"};border:1px solid ${on ? "#a7f3d0" : "#eef0f3"};border-radius:7px"><tr>
+          <td style="padding:7px 2px;text-align:center">
+            <div style="font-size:10.5px;font-weight:800;letter-spacing:.06em;color:${on ? "#065f46" : "#9ca3af"}">${esc(d.dow.toUpperCase())}</div>
+            <div style="font-size:19px;font-weight:800;line-height:1.2;color:${on ? "#047857" : "#c4c9d1"}">${d.jobs.length || (on ? "0" : "–")}</div>
+            <div style="font-size:10px;color:${on ? "#065f46" : "#9ca3af"};white-space:nowrap">${d.jobs.length === 1 ? "job" : "jobs"}</div>
+          </td></tr></table></td>`;
+    }).join("")}</tr></table></td></tr>`;
+
+  // ---- day by day ---------------------------------------------------------
+  const link = (t, text, strong) => `<a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="color:#1d76bb;text-decoration:none;font-weight:${strong ? 700 : 600}">${esc(text)}</a>`;
+  const dayBlock = d => {
+    if (!d.worked) {
+      return `<tr><td style="padding:0 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:1px solid #e5e7eb"><tr>
+          <td style="padding:8px 0;font-size:13px;font-weight:700;color:#9ca3af">${esc(d.long.toUpperCase())} <span style="font-weight:400">&nbsp;${esc(d.date)}</span></td>
+          <td style="padding:8px 0;font-size:12.5px;color:#9ca3af;text-align:right">Nothing logged</td>
+        </tr></table></td></tr>`;
+    }
+    const meta = [d.jobs.length ? plural(d.jobs.length, "job") : "no jobs finished", plural(d.stores.length, "store"), mi(d.miles)].filter(Boolean).join(" · ");
+    const rows = d.stores.map(st => `<tr>
+        <td style="padding:3px 10px 3px 0;font-size:14px;font-weight:600;line-height:1.35;color:#111827" valign="top">${esc(st.label)}</td>
+        <td style="padding:3px 0;font-size:13.5px;line-height:1.35;text-align:right" valign="top">${
+          st.jobs.length ? st.jobs.map(j => link(j, cat(j))).join(`<span style="color:#c4c9d1"> · </span>`)
+            : `<span style="color:#6b7280">on site, ${link(st.any, "not finished")}</span>`}</td></tr>`).join("");
+    return `<tr><td style="padding:0 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:2px solid #111827"><tr>
+          <td style="padding:8px 0 3px;font-size:13px;font-weight:800;color:#111827">${esc(d.long.toUpperCase())} <span style="font-weight:400;color:#6b7280">&nbsp;${esc(d.date)}</span></td>
+          <td style="padding:8px 0 3px;font-size:12.5px;color:#374151;text-align:right;white-space:nowrap">${esc(meta)}</td>
         </tr></table>
-        <div style="font-size:13.5px;color:#4b5563;line-height:1.45;margin-top:4px">${esc(String(t.description || "No description").slice(0, 220))}</div>
-        <div style="font-size:12px;color:#6b7280;margin-top:6px">${esc(t.shortId || "")} &nbsp;\u00b7&nbsp; ${esc(STATUS_LABEL[lc(t.status)] || t.status)} &nbsp;\u00b7&nbsp; <span style="color:#1d76bb;font-weight:600">Open ticket \u203a</span></div>
-      </a></td></tr>`;
-  const block = g => `<tr><td style="padding:18px 24px 0">
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:2px solid #111827"><tr>
-        <td style="padding:10px 0 8px;font-size:17px;font-weight:800;line-height:1.25">${esc(g.label)}</td>
-        <td style="padding:10px 0 8px;font-size:13px;color:#6b7280;text-align:right;white-space:nowrap">${g.rows.length} job${g.rows.length === 1 ? "" : "s"}</td>
-      </tr></table>
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0">${g.rows.map(line).join("")}</table></td></tr>`;
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-bottom:9px">${rows}</table></td></tr>`;
+  };
 
-  const inner = n
-    ? catGrid(categoryCounts(rows)) + groups.map(block).join("") + `<tr><td style="height:20px"></td></tr>`
-    : `<tr><td style="padding:14px 24px 24px"><div style="font-size:15px;line-height:1.55;background:#f9fafb;border:1px solid #e5e7eb;border-radius:9px;padding:14px 16px">
-        No jobs assigned to ${esc(name)} were marked finished or closed in the last ${COMPLETION_DAYS} days.</div></td></tr>`;
+  const note = `<tr><td style="padding:12px 24px 18px;font-size:11.5px;color:#9ca3af;line-height:1.5">
+      Tap a category to open that ticket. Driving is an estimate: straight-line distance between stores in the order they were worked each day, ×${ROAD_FACTOR} for roads. It does not include the drive from home or back${
+      week.noGps ? `, or ${plural(week.noGps, "trip")} to a store with no GPS location on file` : ""}.</td></tr>`;
+
+  const inner = tiles + strip + `<tr><td style="height:16px"></td></tr>` + days.map(dayBlock).join("") + note;
 
   const text = [
-    `${name} \u2014 ${n} job${n === 1 ? "" : "s"} completed, ${range}`, "",
-    ...(n ? groups.map(g => [
-      `${g.label.toUpperCase()}  \u2014  ${g.rows.length}`,
-      ...g.rows.map(t => `  ${shortDay(t._doneAt)} \u00b7 ${categoryPath(t, labels)}\n  ${String(t.description || "No description").replace(/\s+/g, " ").slice(0, 220)}\n  ${ticketUrlFor(app, t)}`),
-      "",
-    ].join("\n")) : [`No jobs assigned to ${name} were marked finished or closed in the last ${COMPLETION_DAYS} days.`]),
+    `${name} — ${range}`,
+    `${plural(n, "job")} done · worked ${worked} of ${days.length} days · ${plural(week.stores, "store")} · ${milesTxt} est. driving`, "",
+    ...days.map(d => d.worked
+      ? [`${d.long.toUpperCase()} ${d.date}  —  ${[d.jobs.length ? plural(d.jobs.length, "job") : "no jobs finished", mi(d.miles)].filter(Boolean).join(" · ")}`,
+         ...d.stores.map(st => `  ${st.label}: ${st.jobs.length ? st.jobs.map(cat).join(", ") : "on site, not finished"}`),
+         ...d.jobs.map(j => `    ${cat(j)} — ${ticketUrlFor(app, j)}`), ""].join("\n")
+      : `${d.long.toUpperCase()} ${d.date}  —  nothing logged\n`),
+    `Driving is an estimate: straight-line distance between stores in the order worked each day, x${ROAD_FACTOR}. Excludes the drive from home and back.`,
   ].join("\n");
 
-  return { subject, html: shell(title, subtitle, inner, "Technician completion report"), text, count: n, stores: groups.length };
+  return { subject, html: shell(name, range, inner, "Technician completion report"), text,
+    count: n, worked, stores: week.stores, miles: Math.round(week.miles) };
 }
 
 /* "Gino Rossi" → "Gino". A first name is how you greet somebody. */
@@ -2123,7 +2201,7 @@ module.exports = async (req, res) => {
       if (!closed) return res.status(200).json({ ok: false, reason: "could not read the closed tickets, so the report would have been incomplete — nothing was sent" });
       const pool = { ...(master.maintenanceTickets || {}), ...closed };
       const nowTs = Date.now();
-      const build = techId => completionBody(master, techs[techId], completionRows(pool, techId, nowTs), sCfg, nowTs);
+      const build = techId => completionBody(master, techs[techId], completionWeek(master, pool, techId, nowTs), sCfg);
       const byName = (a, b) => String((techs[a] || {}).name || "").localeCompare(String((techs[b] || {}).name || ""));
 
       if (mode === "preview" || mode === "test") {
@@ -2164,7 +2242,7 @@ module.exports = async (req, res) => {
         const real = lists[techId];
         const targets = prefs0.testMode ? prefs0.testTo : real;
         const fake = { name: `${tech.name || "this technician"}’s list`, email: real.join(", ") };
-        manifest.push({ techId, name: tech.name || "", jobs: built.count, to: targets.slice(), realTo: real.slice(), subject: built.subject, n: targets.length });
+        manifest.push({ techId, name: tech.name || "", jobs: built.count, worked: built.worked, miles: built.miles, to: targets.slice(), realTo: real.slice(), subject: built.subject, n: targets.length });
         targets.forEach(addr => messages.push({
           From: `FixMi <${cfg.from}>`, To: addr,
           Subject: built.subject,
