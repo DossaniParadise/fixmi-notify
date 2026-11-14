@@ -5,9 +5,11 @@
     "api/inbound.js": { "maxDuration": 20 },
     "api/answer.js": { "maxDuration": 20 },
     "api/monday.js": { "maxDuration": 20 },
-    "api/weekly.js": { "maxDuration": 60 }
+    "api/weekly.js": { "maxDuration": 60 },
+    "api/completion.js": { "maxDuration": 60 }
   },
   "crons": [
-    { "path": "/api/weekly", "schedule": "0 10 * * *" }
+    { "path": "/api/weekly", "schedule": "0 10 * * *" },
+    { "path": "/api/completion", "schedule": "0 2 * * 1" }
   ]
 }
