@@ -1235,52 +1235,35 @@ function milesBetween(a, b) {
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * DEG) * Math.cos(b.lat * DEG) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
-/* What puts a technician AT a store: starting a job, finishing one, or moving
-   its status themselves. Somebody else re-routing their ticket does not. */
-const ON_SITE_ACTIONS = ["clockin", "clockout", "status"];
-
 /** One technician's last seven days: jobs done, where they were, how far. */
 function completionWeek(master, pool, techId, nowTs) {
   const stores = master.restaurants || {};
-  const days = lastDays(nowTs, COMPLETION_DAYS).map(d => ({ ...d, jobs: [], visits: [] }));
+  const days = lastDays(nowTs, COMPLETION_DAYS).map(d => ({ ...d, jobs: [] }));
   const byYmd = new Map(days.map(d => [d.ymd, d]));
   Object.entries(pool || {}).forEach(([id, t0]) => {
     if (!t0 || t0.assignedTechId !== techId) return;
     const t = { ...t0, _id: t0._id || id };
-    if (DONE_STATUSES.includes(lc(t.status))) {
-      const at = techDoneAt(t), day = byYmd.get(ymdCentral(at));
-      if (day) { day.jobs.push({ ...t, _doneAt: at }); day.visits.push({ ts: at, storeId: t.storeId, t }); }
-    }
-    /* Work that did not end in a finished job still happened. Without this a
-       day spent on something now waiting on a part would read as a day off —
-       the wrong answer to the very question this report exists for. */
-    arr(t.activity).forEach(a => {
-      if (!a || !a.ts || lc(a.role) !== "tech" || !ON_SITE_ACTIONS.includes(lc(a.action))) return;
-      const day = byYmd.get(ymdCentral(a.ts));
-      if (day) day.visits.push({ ts: Number(a.ts), storeId: t.storeId, t });
-    });
+    /* Finished jobs only. Clock-ins, comments and other status changes are
+       deliberately not read: this is a report of what got DONE. */
+    if (!DONE_STATUSES.includes(lc(t.status))) return;
+    const at = techDoneAt(t), day = byYmd.get(ymdCentral(at));
+    if (day) day.jobs.push({ ...t, _doneAt: at, _store: storeLabel(stores[t.storeId] || {}) });
   });
   let jobs = 0, miles = 0, noGps = 0, worked = 0;
   const allStores = new Set();
   days.forEach(d => {
     d.jobs.sort((a, b) => a._doneAt - b._doneAt);
-    d.visits.sort((a, b) => a.ts - b.ts);
-    // Stops in the order they happened; back-to-back entries at one store are one stop.
+    // Stops in the order the jobs were finished; back-to-back jobs at one store are one stop.
     const stops = [];
-    d.visits.forEach(v => { if (!stops.length || stops[stops.length - 1] !== v.storeId) stops.push(v.storeId); });
+    d.jobs.forEach(j => { if (!stops.length || stops[stops.length - 1] !== j.storeId) stops.push(j.storeId); });
     d.miles = 0; d.noGps = 0;
     for (let i = 1; i < stops.length; i++) {
       const a = storePoint(stores[stops[i - 1]]), b = storePoint(stores[stops[i]]);
       if (a && b) d.miles += milesBetween(a, b) * ROAD_FACTOR; else d.noGps++;
     }
-    // Stores in the order first reached, each with the jobs finished there.
-    const order = [...new Set(d.visits.map(v => v.storeId))];
-    d.stores = order.map(sid => ({
-      sid, label: storeLabel(stores[sid] || {}),
-      jobs: d.jobs.filter(j => j.storeId === sid),
-      any: (d.visits.find(v => v.storeId === sid) || {}).t,
-    }));
-    d.worked = d.visits.length > 0;
+    const order = [...new Set(d.jobs.map(j => j.storeId))];
+    d.nStores = order.length;
+    d.worked = d.jobs.length > 0;
     jobs += d.jobs.length; miles += d.miles; noGps += d.noGps; if (d.worked) worked++;
     order.forEach(sid => allStores.add(sid));
   });
@@ -1318,7 +1301,7 @@ function completionBody(master, tech, week, cfg) {
           style="background:${on ? "#ecfdf5" : "#f9fafb"};border:1px solid ${on ? "#a7f3d0" : "#eef0f3"};border-radius:7px"><tr>
           <td style="padding:7px 2px;text-align:center">
             <div style="font-size:10.5px;font-weight:800;letter-spacing:.06em;color:${on ? "#065f46" : "#9ca3af"}">${esc(d.dow.toUpperCase())}</div>
-            <div style="font-size:19px;font-weight:800;line-height:1.2;color:${on ? "#047857" : "#c4c9d1"}">${d.jobs.length || (on ? "0" : "–")}</div>
+            <div style="font-size:19px;font-weight:800;line-height:1.2;color:${on ? "#047857" : "#c4c9d1"}">${d.jobs.length || "–"}</div>
             <div style="font-size:10px;color:${on ? "#065f46" : "#9ca3af"};white-space:nowrap">${d.jobs.length === 1 ? "job" : "jobs"}</div>
           </td></tr></table></td>`;
     }).join("")}</tr></table></td></tr>`;
@@ -1329,15 +1312,15 @@ function completionBody(master, tech, week, cfg) {
     if (!d.worked) {
       return `<tr><td style="padding:0 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:1px solid #e5e7eb"><tr>
           <td style="padding:8px 0;font-size:13px;font-weight:700;color:#9ca3af">${esc(d.long.toUpperCase())} <span style="font-weight:400">&nbsp;${esc(d.date)}</span></td>
-          <td style="padding:8px 0;font-size:12.5px;color:#9ca3af;text-align:right">Nothing logged</td>
+          <td style="padding:8px 0;font-size:12.5px;color:#9ca3af;text-align:right">No jobs finished</td>
         </tr></table></td></tr>`;
     }
-    const meta = [d.jobs.length ? plural(d.jobs.length, "job") : "no jobs finished", plural(d.stores.length, "store"), mi(d.miles)].filter(Boolean).join(" · ");
-    const rows = d.stores.map(st => `<tr>
-        <td style="padding:3px 10px 3px 0;font-size:14px;font-weight:600;line-height:1.35;color:#111827" valign="top">${esc(st.label)}</td>
-        <td style="padding:3px 0;font-size:13.5px;line-height:1.35;text-align:right" valign="top">${
-          st.jobs.length ? st.jobs.map(j => link(j, cat(j))).join(`<span style="color:#c4c9d1"> · </span>`)
-            : `<span style="color:#6b7280">on site, ${link(st.any, "not finished")}</span>`}</td></tr>`).join("");
+    const meta = [plural(d.jobs.length, "job"), plural(d.nStores, "store"), mi(d.miles)].filter(Boolean).join(" · ");
+    /* Two columns, one finished job per line: the store, and the category.
+       Both halves of the line open that job's ticket. */
+    const rows = d.jobs.map(j => `<tr>
+        <td style="padding:3px 10px 3px 0;font-size:14px;line-height:1.35" valign="top"><a href="${esc(ticketUrlFor(app, j))}" target="_blank" style="color:#111827;text-decoration:none;font-weight:600">${esc(j._store)}</a></td>
+        <td style="padding:3px 0;font-size:13.5px;line-height:1.35;text-align:right" valign="top">${link(j, cat(j))}</td></tr>`).join("");
     return `<tr><td style="padding:0 24px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:2px solid #111827"><tr>
           <td style="padding:8px 0 3px;font-size:13px;font-weight:800;color:#111827">${esc(d.long.toUpperCase())} <span style="font-weight:400;color:#6b7280">&nbsp;${esc(d.date)}</span></td>
           <td style="padding:8px 0 3px;font-size:12.5px;color:#374151;text-align:right;white-space:nowrap">${esc(meta)}</td>
@@ -1346,7 +1329,7 @@ function completionBody(master, tech, week, cfg) {
   };
 
   const note = `<tr><td style="padding:12px 24px 18px;font-size:11.5px;color:#9ca3af;line-height:1.5">
-      Tap a category to open that ticket. Driving is an estimate: straight-line distance between stores in the order they were worked each day, ×${ROAD_FACTOR} for roads. It does not include the drive from home or back${
+      Tap any job to open its ticket. Driving is an estimate: straight-line distance between stores in the order the jobs were finished each day, ×${ROAD_FACTOR} for roads. It does not include the drive from home or back${
       week.noGps ? `, or ${plural(week.noGps, "trip")} to a store with no GPS location on file` : ""}.</td></tr>`;
 
   const inner = tiles + strip + `<tr><td style="height:16px"></td></tr>` + days.map(dayBlock).join("") + note;
@@ -1355,11 +1338,10 @@ function completionBody(master, tech, week, cfg) {
     `${name} — ${range}`,
     `${plural(n, "job")} done · worked ${worked} of ${days.length} days · ${plural(week.stores, "store")} · ${milesTxt} est. driving`, "",
     ...days.map(d => d.worked
-      ? [`${d.long.toUpperCase()} ${d.date}  —  ${[d.jobs.length ? plural(d.jobs.length, "job") : "no jobs finished", mi(d.miles)].filter(Boolean).join(" · ")}`,
-         ...d.stores.map(st => `  ${st.label}: ${st.jobs.length ? st.jobs.map(cat).join(", ") : "on site, not finished"}`),
-         ...d.jobs.map(j => `    ${cat(j)} — ${ticketUrlFor(app, j)}`), ""].join("\n")
-      : `${d.long.toUpperCase()} ${d.date}  —  nothing logged\n`),
-    `Driving is an estimate: straight-line distance between stores in the order worked each day, x${ROAD_FACTOR}. Excludes the drive from home and back.`,
+      ? [`${d.long.toUpperCase()} ${d.date}  —  ${[plural(d.jobs.length, "job"), mi(d.miles)].filter(Boolean).join(" · ")}`,
+         ...d.jobs.map(j => `  ${j._store} — ${cat(j)}\n    ${ticketUrlFor(app, j)}`), ""].join("\n")
+      : `${d.long.toUpperCase()} ${d.date}  —  no jobs finished\n`),
+    `Driving is an estimate: straight-line distance between stores in the order the jobs were finished each day, x${ROAD_FACTOR}. Excludes the drive from home and back.`,
   ].join("\n");
 
   return { subject, html: shell(name, range, inner, "Technician completion report"), text,
