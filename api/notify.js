@@ -77,6 +77,12 @@ const PREF_DEFAULTS = {
   /* The VP summary has no role behind it — it goes to a named list. */
   vpTo: [],
   digestTo: [],
+  /* The Sunday-night technician completion report. One email per technician,
+     each with its own list of readers, typed into Settings by hand — these
+     are whoever management wants reading that technician's week, so there is
+     no role to derive them from. Keyed by the technician's FindMi id (never
+     by an email address: the database refuses a key with a dot in it). */
+  completion: { on: false, to: {} },
   /* Nudges for tickets that are waiting on the store rather than on a tech.
      This one ships switched on so the feature works the moment both files are
      deployed, rather than waiting for somebody to open Settings and press
@@ -150,6 +156,17 @@ function prefsFrom(master) {
       const v = raw[k];
       p[k] = (Array.isArray(v) ? v : String(v || "").split(/[,;\s]+/)).map(lc).filter(e => e.includes("@"));
     });
+    if (raw.completion && typeof raw.completion === "object") {
+      p.completion.on = !!raw.completion.on;
+      const to = raw.completion.to;
+      if (to && typeof to === "object") {
+        Object.entries(to).forEach(([techId, v]) => {
+          const list = [...new Set((Array.isArray(v) ? v : (v && typeof v === "object" ? Object.values(v) : String(v || "").split(/[,;\s]+/)))
+            .map(lc).filter(e => e.includes("@")))];
+          if (techId && list.length) p.completion.to[techId] = list;
+        });
+      }
+    }
   }
   return p;
 }
@@ -1151,6 +1168,126 @@ function lastWeekFor(techId, pool, nowTs) {
   return { tickets: done.length, stores: new Set(done.map(t => t.storeId)).size };
 }
 
+/* ---- the technician completion report ------------------------------------
+   Sunday night, one email per technician: every job that technician finished
+   or closed in the last seven days, with the store and the category, each
+   line a link to the whole ticket. It is written for whoever manages the
+   technician, not for the technician — so it is a plain list of what got
+   done, nothing to answer and nothing to press.
+
+   WHEN a job counts as done is the technician's own "Finished", not the later
+   "Closed". Closing is whoever checks the work, often days afterwards, and
+   counting from that would move a job done last Tuesday into next week's
+   report — or into both. A ticket that was closed without ever being marked
+   finished falls back to when it was closed. */
+function techDoneAt(t) {
+  const marks = st => arr(t.activity)
+    .filter(a => a && lc(a.toStatus) === st && a.ts).map(a => Number(a.ts));
+  const fin = marks("finished");
+  if (fin.length) return Math.max(...fin);
+  const cl = marks("closed");
+  if (cl.length) return Math.max(...cl);
+  return Number(t.finishedAt) || Number(t.closedAt) || Number(t.updatedAt) || 0;
+}
+const COMPLETION_DAYS = 7;
+/** This technician's finished and closed tickets from the last seven days. */
+function completionRows(pool, techId, nowTs) {
+  const to = nowTs || Date.now(), from = to - COMPLETION_DAYS * 86400000;
+  return Object.entries(pool || {})
+    .filter(([, t]) => t && t.assignedTechId === techId && DONE_STATUSES.includes(lc(t.status)))
+    .map(([id, t]) => ({ ...t, _id: t._id || id, _doneAt: techDoneAt(t) }))
+    .filter(t => t._doneAt >= from && t._doneAt <= to)
+    .sort((a, b) => b._doneAt - a._doneAt);
+}
+/* Category as the app shows it. The stored ticket carries only keys, so the
+   labels come from the category editor's saved lists when there are any and
+   from tidying the key when there are not. */
+function categoryLabels(master) {
+  const cats = {}, subs = {};
+  const stored = (master.admins || {}).divisionCategories;
+  if (stored && typeof stored === "object") {
+    Object.values(stored).forEach(list => arr(list).forEach(c => {
+      if (!c || !c.key) return;
+      if (c.label) cats[c.key] = c.label;
+      arr(c.subs).forEach(sb => { if (sb && sb.key && sb.label) subs[sb.key] = sb.label; });
+    }));
+  }
+  return { cats, subs };
+}
+function categoryPath(t, labels) {
+  const fromApp = String(t.categoryLabel || "").trim();
+  if (fromApp) return fromApp.replace(/\s*[\u2192>|]\s*/g, " \u203a ");
+  const ck = String(t.category || "").trim(), sk = String(t.subcategory || "").trim();
+  if (!ck) return "Other";
+  const c = (labels.cats[ck]) || titleCat(ck);
+  if (!sk) return c;
+  /* Item keys are stored as "<category>_<item>"; without a saved label the
+     category half would otherwise be said twice. */
+  const bare = sk.toLowerCase().startsWith(ck.toLowerCase() + "_") ? sk.slice(ck.length + 1) : sk;
+  return `${c} \u203a ${labels.subs[sk] || titleCat(bare)}`;
+}
+const shortDay = ts => new Date(Number(ts)).toLocaleDateString("en-US", { timeZone: "America/Chicago", weekday: "short", month: "short", day: "numeric" });
+const rangeDay = ts => new Date(Number(ts)).toLocaleDateString("en-US", { timeZone: "America/Chicago", month: "short", day: "numeric" });
+
+function completionBody(master, tech, rows, cfg, nowTs) {
+  const app = (cfg && cfg.appUrl) || DEFAULTS.appUrl;
+  const stores = master.restaurants || {};
+  const labels = categoryLabels(master);
+  const to = nowTs || Date.now(), from = to - COMPLETION_DAYS * 86400000;
+  const range = `${rangeDay(from)} \u2013 ${rangeDay(to)}`;
+  const name = tech.name || "Technician";
+  const n = rows.length;
+
+  // Grouped by store: that is how a week of site visits actually reads.
+  const groups = [];
+  const seen = new Map();
+  rows.forEach(t => {
+    let g = seen.get(t.storeId);
+    if (!g) { g = { sid: t.storeId, label: storeLabel(stores[t.storeId] || {}), rows: [] }; seen.set(t.storeId, g); groups.push(g); }
+    g.rows.push(t);
+  });
+  groups.sort((a, b) => b.rows.length - a.rows.length || a.label.localeCompare(b.label));
+
+  const subject = `FixMi Completion Report \u2014 ${name}: ${n} job${n === 1 ? "" : "s"} completed, ${range}`;
+  const title = `${name} \u2014 ${n} job${n === 1 ? "" : "s"} completed`;
+  const subtitle = n
+    ? `${range} \u00b7 ${groups.length} store${groups.length === 1 ? "" : "s"} \u00b7 tap any job to open the full ticket`
+    : range;
+
+  const line = t => `<tr><td style="padding:0 0 6px">
+      <a href="${esc(ticketUrlFor(app, t))}" target="_blank" style="display:block;text-decoration:none;color:#111827;
+         border:1px solid #e5e7eb;border-left:4px solid #047857;border-radius:9px;padding:11px 14px">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
+          <td style="font-size:15px;font-weight:700;line-height:1.35;color:#111827">${esc(categoryPath(t, labels))}</td>
+          <td style="font-size:12.5px;color:#6b7280;text-align:right;white-space:nowrap;padding-left:10px" valign="top">${esc(shortDay(t._doneAt))}</td>
+        </tr></table>
+        <div style="font-size:13.5px;color:#4b5563;line-height:1.45;margin-top:4px">${esc(String(t.description || "No description").slice(0, 220))}</div>
+        <div style="font-size:12px;color:#6b7280;margin-top:6px">${esc(t.shortId || "")} &nbsp;\u00b7&nbsp; ${esc(STATUS_LABEL[lc(t.status)] || t.status)} &nbsp;\u00b7&nbsp; <span style="color:#1d76bb;font-weight:600">Open ticket \u203a</span></div>
+      </a></td></tr>`;
+  const block = g => `<tr><td style="padding:18px 24px 0">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:2px solid #111827"><tr>
+        <td style="padding:10px 0 8px;font-size:17px;font-weight:800;line-height:1.25">${esc(g.label)}</td>
+        <td style="padding:10px 0 8px;font-size:13px;color:#6b7280;text-align:right;white-space:nowrap">${g.rows.length} job${g.rows.length === 1 ? "" : "s"}</td>
+      </tr></table>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0">${g.rows.map(line).join("")}</table></td></tr>`;
+
+  const inner = n
+    ? catGrid(categoryCounts(rows)) + groups.map(block).join("") + `<tr><td style="height:20px"></td></tr>`
+    : `<tr><td style="padding:14px 24px 24px"><div style="font-size:15px;line-height:1.55;background:#f9fafb;border:1px solid #e5e7eb;border-radius:9px;padding:14px 16px">
+        No jobs assigned to ${esc(name)} were marked finished or closed in the last ${COMPLETION_DAYS} days.</div></td></tr>`;
+
+  const text = [
+    `${name} \u2014 ${n} job${n === 1 ? "" : "s"} completed, ${range}`, "",
+    ...(n ? groups.map(g => [
+      `${g.label.toUpperCase()}  \u2014  ${g.rows.length}`,
+      ...g.rows.map(t => `  ${shortDay(t._doneAt)} \u00b7 ${categoryPath(t, labels)}\n  ${String(t.description || "No description").replace(/\s+/g, " ").slice(0, 220)}\n  ${ticketUrlFor(app, t)}`),
+      "",
+    ].join("\n")) : [`No jobs assigned to ${name} were marked finished or closed in the last ${COMPLETION_DAYS} days.`]),
+  ].join("\n");
+
+  return { subject, html: shell(title, subtitle, inner, "Technician completion report"), text, count: n, stores: groups.length };
+}
+
 /* "Gino Rossi" → "Gino". A first name is how you greet somebody. */
 const firstName = n => String(n || "").trim().split(/\s+/)[0] || "";
 function greeting() {
@@ -1713,7 +1850,7 @@ module.exports = async (req, res) => {
     const want = process.env.FIXMI_SHARED_SECRET || "";
     if (!want) return res.status(500).json({ error: "FIXMI_SHARED_SECRET is not set on the server" });
     if (secret !== want) return res.status(401).json({ error: "bad secret" });
-    const DIAG = ["selftest", "sendtest", "postmark", "summary", "reminders", "digest", "mondayRoundup"];
+    const DIAG = ["selftest", "sendtest", "postmark", "summary", "reminders", "digest", "mondayRoundup", "completion"];
     if (!EVENTS.includes(event) && !DIAG.includes(event)) return res.status(400).json({ error: `event must be one of ${EVENTS.join(", ")}` });
     if (!ticketId && !DIAG.includes(event)) return res.status(400).json({ error: "ticketId is required" });
 
@@ -1963,6 +2100,87 @@ module.exports = async (req, res) => {
       });
       console.log("[fixmi-notify] weekly summaries", { testMode: prefs0.testMode, built: log.length, sent: r3.sent });
       return res.status(200).json({ ok: r3.ok, sent: r3.sent, testMode: prefs0.testMode, people: log, failed: r3.failed, manifest });
+    }
+
+    /* ---- THE TECHNICIAN COMPLETION REPORT ----------------------------------
+       preview  one technician's report, built and handed back; nothing sent
+       test     the same report(s), marked [Sample], to the caller only
+       run      the real thing: each technician's report to that technician's
+                own list from Settings. Sent by the Sunday-night clock, and by
+                the "Send them all now" button.
+       Recipients are only ever read from the saved settings in the master —
+       a caller cannot supply a list of its own. */
+    if (event === "completion") {
+      const prefs0 = prefsFrom(master);
+      const mode = body.mode || "preview";
+      const techs = master.repairTechnicians || {};
+      const sCfg = { appUrl: cfg.appUrl };
+      /* Closed tickets are not in the normal payload, and most of a week's
+         completed work is closed by Sunday — so the closed set is always
+         fetched. If that call fails the report would silently under-count,
+         which is worse than not sending, so it stops and says so. */
+      const closed = await fetchClosed(cfg.masterUrl);
+      if (!closed) return res.status(200).json({ ok: false, reason: "could not read the closed tickets, so the report would have been incomplete — nothing was sent" });
+      const pool = { ...(master.maintenanceTickets || {}), ...closed };
+      const nowTs = Date.now();
+      const build = techId => completionBody(master, techs[techId], completionRows(pool, techId, nowTs), sCfg, nowTs);
+      const byName = (a, b) => String((techs[a] || {}).name || "").localeCompare(String((techs[b] || {}).name || ""));
+
+      if (mode === "preview" || mode === "test") {
+        const want = String(body.techId || "");
+        if (want && !techs[want]) return res.status(200).json({ ok: false, reason: "that technician is no longer in FindMi" });
+        const ids = want ? [want] : Object.keys(techs).sort(byName);
+        if (!ids.length) return res.status(200).json({ ok: false, reason: "there are no technicians in FindMi" });
+        if (mode === "preview") {
+          const built = build(ids[0]);
+          return res.status(200).json({ ok: true, techId: ids[0], forName: techs[ids[0]].name || "", to: prefs0.completion.to[ids[0]] || [], ...built });
+        }
+        const known = knownAddresses(master, prefs0);
+        const mine = [...new Set(arr(body.to).map(lc).filter(e => e.includes("@")))].filter(e => known.has(e));
+        if (!mine.length) return res.status(400).json({ error: "the test address has to be someone FixMi already knows, or a test address from Settings → Email" });
+        if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+        const msgs = [];
+        ids.forEach(id => { const built = build(id);
+          mine.forEach(addr => msgs.push({
+            From: `FixMi <${cfg.from}>`, To: addr, Subject: `[Sample] ${built.subject}`,
+            HtmlBody: built.html, TextBody: built.text,
+            MessageStream: cfg.stream, Tag: "completion", TrackOpens: false, TrackLinks: "None",
+          })); });
+        const rt = await sendBatch(cfg, msgs);
+        return res.status(200).json({ ok: rt.ok, sent: rt.sent, to: mine, test: true, reports: ids.length,
+          forName: ids.length === 1 ? (techs[ids[0]].name || "") : "", failed: rt.failed });
+      }
+
+      // mode "run"
+      if (!cfg.token) return res.status(500).json({ error: "POSTMARK_TOKEN is not set on the server" });
+      if (prefs0.testMode && !prefs0.testTo.length) return res.status(200).json({ ok: false, sent: 0, reason: "test mode is on but no test addresses are set" });
+      const lists = prefs0.completion.to || {};
+      const messages = [], manifest = [], skipped = [];
+      Object.keys(lists).sort(byName).forEach(techId => {
+        const tech = techs[techId];
+        // A list left behind for somebody FindMi no longer has is not sent blind.
+        if (!tech) { skipped.push({ techId, reason: "no longer in FindMi" }); return; }
+        const built = build(techId);
+        const real = lists[techId];
+        const targets = prefs0.testMode ? prefs0.testTo : real;
+        const fake = { name: `${tech.name || "this technician"}’s list`, email: real.join(", ") };
+        manifest.push({ techId, name: tech.name || "", jobs: built.count, to: targets.slice(), realTo: real.slice(), subject: built.subject, n: targets.length });
+        targets.forEach(addr => messages.push({
+          From: `FixMi <${cfg.from}>`, To: addr,
+          Subject: built.subject,
+          HtmlBody: prefs0.testMode ? testBanner(fake, built.html) : built.html,
+          TextBody: (prefs0.testMode ? `TEST MODE — live, this would have gone to ${real.join(", ")}.\n\n` : "") + built.text,
+          MessageStream: cfg.stream, Tag: "completion", TrackOpens: false, TrackLinks: "None",
+        }));
+      });
+      if (!messages.length) return res.status(200).json({ ok: true, sent: 0, skipped,
+        reason: "no technician has anyone listed — add addresses under Technician completion report in Settings → Email, and Save" });
+      const rr = await sendBatch(cfg, messages);
+      let mi = 0;
+      manifest.forEach(row => { const slice = rr.perMessage.slice(mi, mi + row.n); mi += row.n;
+        row.ok = slice.length > 0 && slice.every(x => x.ok); delete row.n; });
+      console.log("[fixmi-notify] completion reports", { testMode: prefs0.testMode, reports: manifest.length, sent: rr.sent });
+      return res.status(200).json({ ok: rr.ok, sent: rr.sent, testMode: prefs0.testMode, reports: manifest.length, manifest, skipped, failed: rr.failed });
     }
 
     /* ---- WHAT CAME BACK FROM THE MONDAY PAGE -------------------------------
