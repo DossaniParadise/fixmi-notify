@@ -1170,7 +1170,7 @@ function lastWeekFor(techId, pool, nowTs) {
 
 /* ---- the technician completion report ------------------------------------
    Sunday night, one email per technician: every job that technician finished
-   or closed in the last seven days, with the store and the category, each
+   or closed in the report week (Sunday to Saturday), with the store and the category, each
    line a link to the whole ticket. It is written for whoever manages the
    technician, not for the technician — so it is a plain list of what got
    done, nothing to answer and nothing to press.
@@ -1189,7 +1189,6 @@ function techDoneAt(t) {
   if (cl.length) return Math.max(...cl);
   return Number(t.finishedAt) || Number(t.closedAt) || Number(t.updatedAt) || 0;
 }
-const COMPLETION_DAYS = 7;
 
 /* ---- the week, one calendar day at a time ---------------------------------
    The reader is an executive asking two things at a glance: were they working
@@ -1199,18 +1198,25 @@ const COMPLETION_DAYS = 7;
    the rest.
 
    Days are Central calendar days, counted on the calendar rather than in
-   24-hour steps so a clock change cannot drop or double a day. Sent on a
-   Sunday night the seven days are exactly Monday to Sunday. */
+   24-hour steps so a clock change cannot drop or double a day. */
 const ymdCentral = ts => {
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Chicago", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(Number(ts)));
   const g = t => (f.find(x => x.type === t) || {}).value || "";
   return `${g("year")}-${g("month")}-${g("day")}`;
 };
-function lastDays(nowTs, n) {
-  const [y, m, d] = ymdCentral(nowTs || Date.now()).split("-").map(Number);
+/* The report week is always the last COMPLETE Sunday-to-Saturday, whatever day
+   it is sent. On the Sunday-night run that is the week that ended yesterday;
+   sent by hand on a Wednesday it is still that same week, not a rolling seven
+   days ending mid-week. Today is never part of it — even on a Saturday, when
+   the current week is one day short of finished, it reports the one before. */
+function reportWeek(nowTs) {
+  const now = nowTs || Date.now();
+  const [y, m, d] = ymdCentral(now).split("-").map(Number);
+  const dow = new Date(Date.UTC(y, m - 1, d, 12)).getUTCDay();      // 0 = Sunday
+  const backToSaturday = dow + 1;                                    // Sun→1 … Sat→7
   const out = [];
-  for (let i = n - 1; i >= 0; i--) {
-    const dt = new Date(Date.UTC(y, m - 1, d - i, 12));
+  for (let i = 6; i >= 0; i--) {
+    const dt = new Date(Date.UTC(y, m - 1, d - backToSaturday - i, 12));
     out.push({
       ymd: dt.toISOString().slice(0, 10),
       dow: dt.toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short" }),
@@ -1235,10 +1241,10 @@ function milesBetween(a, b) {
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * DEG) * Math.cos(b.lat * DEG) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
-/** One technician's last seven days: jobs done, where they were, how far. */
+/** One technician's report week (Sunday to Saturday): jobs done, where, how far. */
 function completionWeek(master, pool, techId, nowTs) {
   const stores = master.restaurants || {};
-  const days = lastDays(nowTs, COMPLETION_DAYS).map(d => ({ ...d, jobs: [] }));
+  const days = reportWeek(nowTs).map(d => ({ ...d, jobs: [] }));
   const byYmd = new Map(days.map(d => [d.ymd, d]));
   Object.entries(pool || {}).forEach(([id, t0]) => {
     if (!t0 || t0.assignedTechId !== techId) return;
